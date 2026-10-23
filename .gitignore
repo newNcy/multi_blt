@@ -1,0 +1,17 @@
+# 构建产物
+build/
+btstack_build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.snoop
+*.log
+
+# 第三方源码（独立仓库）
+third_party/
+
+# 用户数据
+linkkeys.txt
+linkkeys.bak
+paired_names.txt
