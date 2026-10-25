@@ -1,12 +1,12 @@
 @echo off
 setlocal
-set VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat
+set VCVARS=G:\VS2022BuildTools\VC\Auxiliary\Build\vcvars64.bat
 if not exist "%VCVARS%" goto :novc
 call "%VCVARS%"
 if errorlevel 1 goto :vcfail
 
-set BT=d:\dual blt\third_party\btstack
-set PORT=d:\dual blt\btstack_port
+set BT=g:\multi_blt\third_party\btstack
+set PORT=g:\multi_blt\btstack_port
 set OUT=d:\btstack_build
 if not exist "%OUT%" mkdir "%OUT%"
 del /q "%OUT%\*.obj" 2>nul

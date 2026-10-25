@@ -59,3 +59,16 @@ void BtSvcFeedAudio(const short* pcm, int frames, int feedRate);
 // 是否用内置测试音代替真实音频（验证链路用）
 void BtSvcSetTestTone(bool on);
 bool BtSvcTestTone();
+
+// 推流音量（软件增益，作用于编码前的 PCM，1.0 = 原始电平，0 = 静音）
+void BtSvcSetGain(float gain);
+float BtSvcGetGain();
+
+// 当前连接/推流中的设备地址（无连接返回空串）
+const char* BtSvcCurrentAddr();
+
+// 指定要使用的 USB 蓝牙适配器（VID/PID）。需重启服务线程后生效。
+void BtSvcSetUsbDevice(unsigned vid, unsigned pid);
+
+// 当前配置使用的适配器 VID/PID
+void BtSvcGetUsbDevice(unsigned& vid, unsigned& pid);

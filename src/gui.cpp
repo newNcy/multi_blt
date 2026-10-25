@@ -528,44 +528,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 {
     g_inst = hInst;
 
-    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 1;
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
 
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
-    g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
-    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                   IID_PPV_ARGS(&g_enum))) && g_enum) {
-        g_notify.hwnd = nullptr;   // 窗口建好后再注册
-    }
-
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.lpszClassName = L"DualBltMainWindow";
-    if (!RegisterClassW(&wc)) { CoUninitialize(); return 1; }
-
-    g_hwnd = CreateWindowExW(0, L"DualBltMainWindow", L"DualBlt 双路音频输出",
-                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                             CW_USEDEFAULT, CW_USEDEFAULT, 620, 640,
-                             nullptr, nullptr, hInst, nullptr);
-    if (!g_hwnd) { CoUninitialize(); return 1; }
-
-    g_notify.hwnd = g_hwnd;
-    if (g_enum) g_enum->RegisterEndpointNotificationCallback(&g_notify);
-
-    RefreshDevices();
-    SetRunningUI(false);
-    ShowWindow(g_hwnd, SW_SHOW);
-    UpdateWindow(g_hwnd);
-
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
+    // DualBlt = BTstack 推流面板（ImGui 版，内部自管消息与渲染循环）
+    // WebView2 版（src/btpanel3.cpp，备用）曾验证：G 盘可移动磁盘 I/O 会导致
+    // 其用户数据目录读写挂起，故停用；如需启用参照 build.bat 注释加回。
+    ShowBtA2dpPanel(nullptr);
 
     CoUninitialize();
     return 0;

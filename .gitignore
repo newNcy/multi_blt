@@ -15,3 +15,7 @@ third_party/
 linkkeys.txt
 linkkeys.bak
 paired_names.txt
+ 
+# UI 布局缓存与安装日志 
+imgui.ini 
+winusb/install_log.txt 

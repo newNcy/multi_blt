@@ -35,7 +35,7 @@
 #include "hci_transport_usb.h"
 
 #define NUM_CHANNELS            2
-#define NUM_STREAMS             2      // 双路推流
+#define NUM_STREAMS             6      // 多路推流（受无线电带宽限制，实际建议 ≤4 路）
 #define AUDIO_TIMEOUT_MS        10
 #define SBC_STORAGE_SIZE        1030
 #define PREFERRED_SAMPLING_RATE 48000
@@ -51,6 +51,9 @@ static BtSvcDeviceFn          g_devFn = nullptr;
 static void*                  g_cbUser = nullptr;
 static char                   g_addr[32] = "";
 static std::atomic<bool>      g_testTone{ false };
+static std::atomic<float>     g_gain{ 1.0f };   // 推流音量（软件增益）
+static unsigned               g_usbVid = 0x0A12;
+static unsigned               g_usbPid = 0x0001;
 static std::atomic<int>       g_phaseIdx{ 0 };
 static std::atomic<bool>      g_restartReq{ false };
 static volatile bool          g_pairing = false;
@@ -61,11 +64,15 @@ static std::atomic<bool>      g_cmdScan{ false };
 static std::atomic<bool>      g_cmdConnect{ false };
 static std::atomic<bool>      g_cmdPair{ false };
 static std::atomic<bool>      g_cmdDisconnect{ false };
+static std::atomic<DWORD>     g_disconnectTick{ 0 };   // 断开冷却：防止断开后立即误重连
+static char                   g_rejectAddr[32] = "";   // 用户刚断开的地址：拒绝其自动重连
+static std::atomic<DWORD>     g_rejectUntil{ 0 };
 static volatile bool          g_pairForce = false;
 static int                    g_pairTicks = 0;
 static volatile bool          g_pairDelayConnect = false;
 static int                    g_pairDelayTicks = 0;
-static char                   g_pendingAddr[32] = "";  // 双路串行化：排队等待的第二副耳机
+static char                   g_pendingAddr[8][32] = {};  // 串行化排队：等当前路建流完成后再连下一路
+static int                    g_pendingCount = 0;
 static volatile bool          g_scanActive = false;
 static volatile bool          g_btUp = false;
 static std::atomic<bool>      g_runLoopUp{ false };   // run loop 是否存活（防跨线程误调用）
@@ -131,6 +138,7 @@ typedef struct {
     int      negRate;                // 本路协商采样率
     uint32_t pktCount;
     uint32_t byteCount;
+    uint32_t dropCount;              // 发送未完成（缓冲满等）次数，保留数据待重试
 } sending_ctx_t;
 
 static sending_ctx_t            media[NUM_STREAMS];
@@ -237,15 +245,18 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
         // 关键：主动设置耳机绝对音量（有些 TWS 没收到这个命令就静音）
         avrcp_controller_set_absolute_volume(acid, 127);   // 100%
         avrcp_controller_enable_notification(acid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
+        Post(L"AVRCP: 控制通道已建立 cid=0x%04x，已下发绝对音量 127", acid);
         break;
     }
     case AVRCP_SUBEVENT_CONNECTION_RELEASED: {
         uint16_t acid = avrcp_subevent_connection_released_get_avrcp_cid(packet);
+        Post(L"AVRCP: 通道释放 cid=0x%04x", acid);
         for (int i = 0; i < NUM_STREAMS; ++i)
             if (media[i].avrcp_cid == acid) media[i].avrcp_cid = 0;
         break;
     }
     default:
+        Post(L"AVRCP[?]: 未处理子事件 0x%02x", packet[2]);
         break;
     }
 }
@@ -269,6 +280,7 @@ static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, u
         break;
     }
     default:
+        Post(L"AVRCP[target]: 未处理子事件 0x%02x", packet[2]);
         break;
     }
 }
@@ -284,12 +296,13 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
              avrcp_subevent_notification_volume_changed_get_absolute_volume(packet) * 100 / 127);
         break;
     default:
+        Post(L"AVRCP[ctrl]: 未处理子事件 0x%02x", packet[2]);
         break;
     }
 }
 
 static uint8_t media_sbc_codec_capabilities[] = {
-    (AVDTP_SBC_44100 << 4) | AVDTP_SBC_48000 | AVDTP_SBC_STEREO,
+    (AVDTP_SBC_44100 << 4) | AVDTP_SBC_48000 | AVDTP_SBC_JOINT_STEREO | AVDTP_SBC_STEREO,
     0xFF,
     2, 53
 };
@@ -333,6 +346,16 @@ static bool PullFrameIdx(int i, short out[2])
 
 static void ProduceAudioIdx(int i, int16_t * pcm, int num_frames)
 {
+    // 防止积累延迟：超过 ~200ms 才跳到 ~20ms 处（阈值太紧会因喂入抖动频繁跳变，
+    // 每次跳变 = 重采样位置瞬移 = 可闻咔哒声；200ms 内的波动让它自然流过）
+    // 必须放在最前：测试音期间回环采集若仍在喂 ring，不跳转的话水位会积压到几十秒
+    int rate = media[i].negRate > 0 ? media[i].negRate : 44100;
+    int hi = rate / 5;     // ~200ms
+    int lo = rate / 50;    // ~20ms
+    if (RingAvailableIdx(i) > hi) {
+        media[i].phase = (double)(g_wpos.load() - (uint64_t)lo);
+    }
+
     if (g_testTone.load()) {
         static double phase = 0.0;
         static bool logged = false;
@@ -365,14 +388,6 @@ static void ProduceAudioIdx(int i, int16_t * pcm, int num_frames)
             pcm[2 * k + 1] = 0;
         }
     }
-
-    // 防止积累延迟：保持很低的水位。超过 ~50ms 就跳到 ~20ms 处。
-    int rate = media[i].negRate > 0 ? media[i].negRate : 44100;
-    int hi = rate / 20;    // ~50ms
-    int lo = rate / 50;    // ~20ms
-    if (RingAvailableIdx(i) > hi) {
-        media[i].phase = (double)(g_wpos.load() - (uint64_t)lo);
-    }
 }
 
 // ------------------------------------------------------------ 发送（按流）
@@ -385,11 +400,31 @@ static void send_media_packet(int i)
     int r = a2dp_source_stream_send_media_payload_rtp(media[i].a2dp_cid, media[i].local_seid, 0,
                                               media[i].rtp_timestamp,
                                               media[i].sbc_storage, media[i].sbc_storage_count + 1);
+    if (r != 0) {
+        // 关键修复：包没发出去（如 BTSTACK_ACL_BUFFERS_FULL）时保留帧数据待重试。
+        // 之前这里直接清空 = 丢帧；连续丢帧会让部分音箱（如 K3）停止输出。
+        media[i].dropCount++;
+        if ((media[i].dropCount % 20) == 1)
+            Post(L"发送[%d]：发送未完成 ret=%d，保留 %u 字节待重试", i, r, media[i].sbc_storage_count);
+        return;
+    }
     media[i].rtp_timestamp += nframes * sbc_encoder_instance[i]->num_audio_frames(&sbc_encoder_state[i]);
     media[i].pktCount++;
     media[i].byteCount += media[i].sbc_storage_count + 1;
     if ((media[i].pktCount % 200) == 1)
         Post(L"发送[%d]：第 %u 包, ret=%d, 累计 %u 字节", i, media[i].pktCount, r, media[i].byteCount);
+    if (media[i].pktCount <= 3) {
+        // 诊断：RTP 头应为 0x80 0x60（PT=96），SBC 帧首字节应为 0x9C（同步字）
+        wchar_t hex[200] = L"";
+        int n = media[i].sbc_storage_count + 1;
+        if (n > 24) n = 24;
+        for (int k = 0; k < n; ++k)
+            swprintf_s(hex + k * 3, 200 - k * 3, L"%02X ", media[i].sbc_storage[k]);
+        Post(L"媒体包[%d]#%u: 帧长=%u 帧数=%u 总长=%u mtu=%u 前%d字节: %s",
+             i, media[i].pktCount, frame_len, nframes,
+             media[i].sbc_storage_count + 1, media[i].max_media_payload_size,
+             n, hex);
+    }
     media[i].sbc_storage_count = 0;
     media[i].sbc_ready_to_send = 0;
 }
@@ -402,6 +437,16 @@ static void fill_sbc_buffer(int i)
         && (media[i].max_media_payload_size - media[i].sbc_storage_count) >= flen) {
         int16_t pcm[256 * NUM_CHANNELS];
         ProduceAudioIdx(i, pcm, spb);
+        // 软件增益：编码前缩放 PCM（推流音量，与系统音量无关，保证可控）
+        float gain = g_gain.load();
+        if (gain != 1.0f) {
+            for (int k = 0; k < spb * NUM_CHANNELS; ++k) {
+                int v = (int)(pcm[k] * gain);
+                if (v > 32767) v = 32767;
+                if (v < -32768) v = -32768;
+                pcm[k] = (int16_t)v;
+            }
+        }
         sbc_encoder_instance[i]->encode_signed_16(&sbc_encoder_state[i], pcm,
                                                &media[i].sbc_storage[1 + media[i].sbc_storage_count]);
         media[i].sbc_storage_count += flen;
@@ -443,7 +488,18 @@ static void audio_timeout(btstack_timer_source_t * ts)
              dpkt / 5);
     }
 
-    if (media[i].sbc_ready_to_send) return;
+    if (media[i].sbc_ready_to_send) {
+        // 有保留的帧等待发送（上次因缓冲满未完成）：每 10ms 重新请求一次 CAN_SEND
+        a2dp_source_stream_endpoint_request_can_send_now(media[i].a2dp_cid, media[i].local_seid);
+        return;
+    }
+    // 关键修复：不要发“编码后的静音”。流刚建立就持续发全零 SBC 帧，会让部分音箱
+    // （如 K3）判定无信号而静音输出，之后即使真实音频到来也保持静音。
+    // 没有测试音且 ring 里没有数据时保持静默不发，等真实音频到达再开始推流。
+    if (!g_testTone.load() && RingAvailableIdx(i) <= 0) {
+        media[i].time_audio_data_sent = btstack_run_loop_get_time_ms();  // 防止补样累积
+        return;
+    }
     fill_sbc_buffer(i);
     // 有帧就发（低延迟）：不再攒满大包，每 10ms 发一次当前帧
     if (media[i].sbc_storage_count > 0) {
@@ -521,13 +577,26 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
             break;
         }
         {
+            bd_addr_t addr;
+            a2dp_subevent_signaling_connection_established_get_bd_addr(packet, addr);
+            const char* addrS = bd_addr_to_str(addr);
+            // 用户刚手动断开的地址：拒绝其自动重连（音箱会自己重连建流）
+            if (g_rejectAddr[0] && GetTickCount() < g_rejectUntil.load() &&
+                _stricmp(addrS, g_rejectAddr) == 0) {
+                Post(L"BTstack: 已拒绝 %S 的自动重连（用户刚断开）", addrS);
+                a2dp_source_disconnect(cid);
+                break;
+            }
             int i = FindStreamByCid(cid);
             if (i < 0) i = FindFreeStream();
             if (i >= 0) {
                 media[i].a2dp_cid = cid;
-                bd_addr_t addr;
-                a2dp_subevent_signaling_connection_established_get_bd_addr(packet, addr);
-                strcpy_s(media[i].addr, sizeof(media[i].addr), bd_addr_to_str(addr));
+                strcpy_s(media[i].addr, sizeof(media[i].addr), addrS);
+                // 主动发起 AVRCP：很多音箱（如 K3）不主动建 AVRCP，绝对音量/播放状态就同步不了
+                if (media[i].avrcp_cid == 0) {
+                    int r = avrcp_connect(addr, &media[i].avrcp_cid);
+                    Post(L"BTstack: 主动发起 AVRCP 连接 %S ret=%d", media[i].addr, r);
+                }
             }
         }
         g_pairing = false;
@@ -557,7 +626,18 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
             default:                              c.channel_mode = SBC_CHANNEL_MODE_MONO; break;
             }
             media[i].negRate = c.sampling_frequency;
-            Post(L"AVDTP[%d]: SBC 已协商 %uHz -> 建立媒体通道…", i, c.sampling_frequency);
+            const wchar_t* cm = L"?";
+            switch (c.channel_mode) {
+            case SBC_CHANNEL_MODE_JOINT_STEREO: cm = L"joint_stereo"; break;
+            case SBC_CHANNEL_MODE_STEREO:       cm = L"stereo";       break;
+            case SBC_CHANNEL_MODE_DUAL_CHANNEL: cm = L"dual";         break;
+            default:                            cm = L"mono";         break;
+            }
+            Post(L"AVDTP[%d]: SBC 已协商 %uHz %s 块%d 子带%d 分配%d bitpool%d->%d -> 建立媒体通道…",
+                 i, c.sampling_frequency, cm, c.block_length, (int)a2dp_subevent_signaling_media_codec_sbc_configuration_get_subbands(packet),
+                 (int)a2dp_subevent_signaling_media_codec_sbc_configuration_get_allocation_method(packet) - 1,
+                 (int)a2dp_subevent_signaling_media_codec_sbc_configuration_get_min_bitpool_value(packet),
+                 c.max_bitpool_value);
             sbc_encoder_instance[i] = btstack_sbc_encoder_bluedroid_init_instance(&sbc_encoder_state[i]);
             sbc_encoder_instance[i]->configure(&sbc_encoder_state[i], SBC_MODE_STANDARD,
                                             c.block_length, c.subbands,
@@ -594,9 +674,16 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
             g_retries = 0;
             g_strategy = 0;
             Post(L"BTstack[%d]: 正在推流", i);
+            int nStreaming = 0;
+            for (int k = 0; k < NUM_STREAMS; ++k)
+                if (media[k].stream_opened && media[k].streaming) nStreaming++;
+            if (nStreaming >= 3)
+                Post(L"BTstack: 已有 %d 路推流 —— 多路共享无线带宽，路数越多越可能卡顿", nStreaming);
             play_info.status = AVRCP_PLAYBACK_STATUS_PLAYING;
-            if (media[i].avrcp_cid)
+            if (media[i].avrcp_cid) {
                 avrcp_target_set_playback_status(media[i].avrcp_cid, AVRCP_PLAYBACK_STATUS_PLAYING);
+                avrcp_controller_set_absolute_volume(media[i].avrcp_cid, 127);   // 流启动后重发音量
+            }
             start_streaming(i);
         }
         break;
@@ -644,8 +731,25 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
         }
         break;
 
+    case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED: {
+        // 信令通道被对端关闭（或我方断开）：清流状态，否则残留 cid 影响重连
+        cid = a2dp_subevent_signaling_connection_released_get_a2dp_cid(packet);
+        int i = FindStreamByCid(cid);
+        Post(L"BTstack[%d]: A2DP 信令断开 cid=0x%04x", i, cid);
+        if (i >= 0) {
+            media[i].a2dp_cid   = 0;
+            media[i].stream_opened = 0;
+            media[i].streaming  = 0;
+            btstack_run_loop_remove_timer(&media[i].audio_timer);
+            if (!AnyStreamStreaming()) g_running.store(false);
+        }
+        break;
+    }
+
     default:
-        break;   // 其余事件不刷 UI
+        // 诊断：把所有未处理子事件打出来，避免错误被静默吞掉
+        Post(L"A2DP[?]: 未处理子事件 0x%02x", hci_event_a2dp_meta_get_subevent_code(packet));
+        break;
     }
 }
 
@@ -753,9 +857,15 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
     if (packet_type != HCI_EVENT_PACKET) return;
     uint8_t evt = hci_event_packet_get_type(packet);
 
-    // 栈就绪：置位 g_btUp，接续用户在就绪前发出的扫描/连接请求
+    // 栈状态：置位/复位 g_btUp，接续用户在就绪前发出的扫描/连接请求
     if (evt == BTSTACK_EVENT_STATE) {
-        if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING) return;
+        if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING) {
+            if (g_btUp) {
+                g_btUp = false;
+                Post(L"BTstack: 协议栈已停止（USB 移除或异常）");
+            }
+            return;
+        }
         g_btUp = true;
         bd_addr_t a;
         gap_local_bd_addr(a);
@@ -886,7 +996,17 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
     }
 
     if (evt == GAP_EVENT_INQUIRY_COMPLETE) {
-        if (g_scanActive && app_state == 0) gap_inquiry_start(8);   // 循环扫描
+        if (g_scanActive && app_state == 0) {
+            gap_inquiry_start(8);   // 循环扫描
+        } else {
+            if (g_scanActive) g_phaseIdx.store(AnyStreamStreaming() ? 3 : 0);
+            Post(L"BTstack: 扫描结束");
+        }
+        return;
+    }
+
+    if (evt == 0x18) {   // HCI Hardware Error：控制器/USB 异常
+        Post(L"BTstack: 收到硬件错误事件（控制器或 USB 异常）");
         return;
     }
 }
@@ -894,6 +1014,18 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
 // ------------------------------------------------------------ 命令轮询（GUI → BTstack 线程）
 
 static btstack_timer_source_t g_pollTimer;
+
+// 撤销悬空的经典蓝牙寻呼（HCI_Create_Connection_Cancel）。
+// 本 btstack 版本的 gap_connect_cancel() 只覆盖 LE 且包在 ENABLE_LE_CENTRAL 里，
+// 经典蓝牙的 pending page 只能直接发 HCI 命令撤（l2cap.c 已处理其 Command Complete）。
+// 必须在 btstack 线程内调用（poll_timer_handler / packet_handler 上下文）。
+static void ClassicConnectCancel(const char* addr)
+{
+    if (!addr || !addr[0]) return;
+    bd_addr_t target;
+    sscanf_bd_addr(addr, target);
+    hci_send_cmd(&hci_create_connection_cancel, target);
+}
 
 static void poll_timer_handler(btstack_timer_source_t * ts)
 {
@@ -952,17 +1084,45 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
         app_state = 0;
         g_phaseIdx.store(1);
         if (g_btUp) {
+            // 关键：撤销悬空的连接请求。上一次失败可能留下未完成的 create_connection
+            // （ACL 永远不完成，handle=0xffff），BR/EDR 控制器 inquiry 与 page 共用基带，
+            // pending page 不撤销，inquiry 实际执行不了 → 扫描结果恒为空
+            g_pairing = false;
+            g_pairForce = false;
+            ClassicConnectCancel(g_connectAddr);
             gap_inquiry_start(8);
             Post(L"BTstack: 扫描已开始");
+            if (AnyStreamStreaming())
+                Post(L"BTstack: 推流中扫描 —— 已连接的设备不会出现在结果里（它们不可发现）");
+        } else {
+            Post(L"BTstack: 扫描请求已排队，等待适配器就绪…");
         }
     }
     if (g_cmdDisconnect.exchange(false)) {
         for (int i = 0; i < NUM_STREAMS; ++i) {
             if (media[i].a2dp_cid != 0) {
                 Post(L"BTstack[%d]: 断开 A2DP cid=0x%04x", i, media[i].a2dp_cid);
+                // 先告诉对端播放已停止，否则音箱会趁链路未断自动重开 AVDTP 流（假断开）
+                if (media[i].avrcp_cid)
+                    avrcp_target_set_playback_status(media[i].avrcp_cid, AVRCP_PLAYBACK_STATUS_STOPPED);
                 a2dp_source_disconnect(media[i].a2dp_cid);
             }
+            // 连 ACL 链路一起断开：只关 AVDTP 时音箱会立刻重开流
+            if (media[i].addr[0]) {
+                bd_addr_t daddr;
+                sscanf_bd_addr(media[i].addr, daddr);
+                hci_connection_t* conn = hci_connection_for_bd_addr_and_type(daddr, BD_ADDR_TYPE_ACL);
+                if (conn) {
+                    Post(L"BTstack[%d]: 断开 ACL 链路 handle=0x%04x", i, conn->con_handle);
+                    gap_disconnect(conn->con_handle);
+                }
+            }
             btstack_run_loop_remove_timer(&media[i].audio_timer);
+            // 记入拒绝名单：该设备（已配对）会自动重连建流，8 秒内一律拒绝
+            if (media[i].addr[0]) {
+                strcpy_s(g_rejectAddr, sizeof(g_rejectAddr), media[i].addr);
+                g_rejectUntil.store(GetTickCount() + 8000);
+            }
             media[i].a2dp_cid = 0;
             media[i].stream_opened = 0;
             media[i].streaming = 0;
@@ -971,7 +1131,7 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
         if (!AnyStreamStreaming()) g_running.store(false);
         // 用户主动断开 = 停止引擎对当前目标的一切尝试
         g_connectAddr[0] = 0;
-        g_pendingAddr[0] = 0;
+        g_pendingCount = 0;
         g_strategy = 0;
         g_phaseIdx.store(0);
     }
@@ -1009,14 +1169,16 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
             Post(L"BTstack: 发起配对 %S（删旧密钥->全新SSP）ret=%d", g_connectAddr, r);
         }
     }
-    // 双路串行化：第一路完全就绪后，自动发起排队的第二路
-    if (g_pendingAddr[0] && !AnyStreamInSetup() && !g_pairing && !g_pairForce) {
+    // 串行化：上一路完全就绪后，自动发起排队的下一路
+    if (g_pendingCount > 0 && !AnyStreamInSetup() && !g_pairing && !g_pairForce) {
         char pend[32];
-        strcpy_s(pend, sizeof(pend), g_pendingAddr);
-        g_pendingAddr[0] = 0;
+        strcpy_s(pend, sizeof(pend), g_pendingAddr[0]);
+        for (int k = 1; k < g_pendingCount; ++k)
+            strcpy_s(g_pendingAddr[k - 1], 32, g_pendingAddr[k]);
+        g_pendingCount--;
         strcpy_s(g_connectAddr, sizeof(g_connectAddr), pend);
         g_cmdConnect.store(true);
-        Post(L"BTstack: 第一路已就绪，开始连接第二副 %S", pend);
+        Post(L"BTstack: 上一路已就绪，开始连接下一路 %S", pend);
     }
 
     // 建流卡死看门狗：有流在建立中超过 45 秒（耳机对媒体通道不应答等），
@@ -1028,6 +1190,10 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
             for (int i = 0; i < NUM_STREAMS; ++i) {
                 if (media[i].a2dp_cid != 0 && !media[i].stream_opened) {
                     Post(L"BTstack[%d]: 建流 45 秒无进展，断开重试…", i);
+                    // 先撤销底层 create_connection：超时常因为 ACL 一直没完成
+                    // （对端不应答 page），不撤销的话悬空 page 会占住基带，
+                    // 之后的重试连不上、扫描也扫不出任何设备
+                    ClassicConnectCancel(media[i].addr);
                     a2dp_source_disconnect(media[i].a2dp_cid);
                     media[i].a2dp_cid = 0;
                     schedule_retry(media[i].addr);
@@ -1040,44 +1206,63 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
 
     if (g_cmdConnect.exchange(false)) {
         if (g_connectAddr[0]) {
+            // 断开冷却：断开后 1 秒内的连接请求忽略（防双击/时序竞态误重连）
+            DWORD dt = GetTickCount() - g_disconnectTick.load();
+            if (dt < 1000) {
+                Post(L"BTstack: 断开冷却中（%ums），忽略连接 %S", dt, g_connectAddr);
+                g_phaseIdx.store(0);
+                btstack_run_loop_set_timer(ts, 200);
+                btstack_run_loop_add_timer(ts);
+                return;
+            }
             g_scanActive = false;
             g_passiveMode = false;
             gap_inquiry_stop();
             app_state = 1;
             g_phaseIdx.store(2);
             g_pairing = false;
+            g_rejectAddr[0] = 0;            // 用户主动连接：撤销拒绝名单
+            g_rejectUntil.store(0);
 
-            // 双路：已有此地址的流 → 复用；否则找空闲流（优先 0 路）
+            // 多路：已有此地址的流 → 复用；否则找空闲流
             int i = FindStreamByAddr(g_connectAddr);
+            if (i >= 0 && media[i].stream_opened) {
+                // 该地址已在推流：不重复建流，仅恢复状态显示
+                Post(L"BTstack[%d]: %S 已在推流，忽略重复连接", i, g_connectAddr);
+                g_phaseIdx.store(3);
+            } else {
             if (i < 0) i = FindFreeStream();
             if (i < 0) {
-                Post(L"BTstack: 两个通道都已占用（%S / %S）",
-                     media[0].addr[0] ? media[0].addr : "-",
-                     media[1].addr[0] ? media[1].addr : "-");
+                Post(L"BTstack: 所有推流通道已占用（上限 %d 路，断开一些再连）", NUM_STREAMS);
             } else if (AnyStreamInSetup() && FindStreamByAddr(g_connectAddr) != i) {
-                // 串行化：有流正在建立中，第二路排队等待（避免 btstack SEP 发现并发断言）
-                strcpy_s(g_pendingAddr, sizeof(g_pendingAddr), g_connectAddr);
-                Post(L"BTstack: 第一路正在建立中，第二副 %S 已排队，就绪后自动连接", g_connectAddr);
+                // 串行化：有流正在建立中，后续路排队等待（避免 btstack SEP 发现并发断言）
+                if (g_pendingCount < 8) {
+                    strcpy_s(g_pendingAddr[g_pendingCount], 32, g_connectAddr);
+                    g_pendingCount++;
+                    Post(L"BTstack: 有流正在建立中，%S 已排队，就绪后自动连接", g_connectAddr);
+                } else {
+                    Post(L"BTstack: 排队已满，%S 的连接请求被忽略", g_connectAddr);
+                }
             } else {
                 // 若该流还有残留信令连接，先清掉再建，避免 establish 返回 cid=0
                 if (media[i].a2dp_cid != 0 && !media[i].stream_opened) {
                     a2dp_source_disconnect(media[i].a2dp_cid);
                     media[i].a2dp_cid = 0;
                 }
-                // 懒创建第二路的 stream endpoint（只在真正连接第二副时）
+                // 懒创建该路的 stream endpoint（第 0 路在 app_init 创建，其余首次连接时创建）
                 bool epOk = true;
                 if (i > 0 && !local_stream_endpoint[i]) {
                     local_stream_endpoint[i] = a2dp_source_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_SBC,
                             media_sbc_codec_capabilities, sizeof(media_sbc_codec_capabilities),
                             media_sbc_codec_configuration, sizeof(media_sbc_codec_configuration));
                     if (!local_stream_endpoint[i]) {
-                        Post(L"BTstack: 创建第二路端点失败");
+                        Post(L"BTstack: 创建推流端点失败");
                         epOk = false;
                     } else {
                         avdtp_set_preferred_sampling_frequency(local_stream_endpoint[i], PREFERRED_SAMPLING_RATE);
                         media[i].local_seid = avdtp_local_seid(local_stream_endpoint[i]);
                         avdtp_source_register_delay_reporting_category(media[i].local_seid);
-                        Post(L"BTstack: 已创建第二路端点 seid=%u", media[i].local_seid);
+                        Post(L"BTstack: 已创建推流端点[%d] seid=%u", i, media[i].local_seid);
                     }
                 }
                 if (epOk) {
@@ -1088,6 +1273,7 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
                     uint8_t st = a2dp_source_establish_stream(target, &media[i].a2dp_cid);
                     Post(L"BTstack[%d]: establish_stream status=0x%02x cid=0x%04x", i, st, media[i].a2dp_cid);
                 }
+            }
             }
         }
     }
@@ -1190,6 +1376,8 @@ void BtSvcConnect(const char* addr)
 void BtSvcDisconnect()
 {
     if (!g_thread.joinable()) return;
+    g_phaseIdx.store(0);   // 立即反馈：UI 马上退出"推流中"动画，不等线程 tick（线程内会再清一次状态）
+    g_disconnectTick.store(GetTickCount());
     g_cmdDisconnect.store(true);
 }
 
@@ -1250,6 +1438,42 @@ void BtSvcSetTestTone(bool on)
 {
     g_testTone.store(on);
     Post(L"BTstack: 测试音 = %s", on ? L"开" : L"关");
+}
+
+void BtSvcSetGain(float gain)
+{
+    if (gain < 0) gain = 0;
+    if (gain > 2) gain = 2;
+    float old = g_gain.exchange(gain);
+    // 轮询同步会高频调用，值未变化时打日志会刷屏
+    if (old != gain)
+        Post(L"BTstack: 推流音量 = %d%%", (int)(gain * 100 + 0.5f));
+}
+
+void BtSvcSetUsbDevice(unsigned vid, unsigned pid)
+{
+    g_usbVid = vid;
+    g_usbPid = pid;
+    Post(L"BTstack: 适配器 = VID_%04X PID_%04X", vid, pid);
+}
+
+void BtSvcGetUsbDevice(unsigned& vid, unsigned& pid)
+{
+    vid = g_usbVid;
+    pid = g_usbPid;
+}
+
+float BtSvcGetGain()
+{
+    return g_gain.load();
+}
+
+const char* BtSvcCurrentAddr()
+{
+    for (int i = 0; i < NUM_STREAMS; ++i)
+        if (media[i].stream_opened || media[i].streaming || media[i].a2dp_cid)
+            return media[i].addr;
+    return g_connectAddr[0] ? g_connectAddr : "";
 }
 
 bool BtSvcStart(const char* addr, BtSvcStatusFn cb, BtSvcDeviceFn devFn, void* user)
@@ -1316,18 +1540,22 @@ static DWORD WINAPI BtThread(LPVOID)
         btstack_memory_init();
         btstack_run_loop_init(btstack_run_loop_windows_get_instance());
         // btsnoop 抓包：完整记录 HCI 命令/事件/ACL，便于离线分析 L2CAP 交互
-        hci_dump_windows_fs_open("d:\\dual blt\\dualblt.snoop", HCI_DUMP_BTSNOOP);
+        if (hci_dump_windows_fs_open("g:\\multi_blt\\dualblt.snoop", HCI_DUMP_BTSNOOP) != 0)
+            Post(L"BTstack: btsnoop 打开失败（不影响功能）");
         hci_dump_init(hci_dump_windows_fs_get_instance());
 
         Post(L"BTstack: 打开 USB 传输…");
         hci_init(hci_transport_usb_instance(), NULL);
-        hci_transport_usb_add_device(0x0a12, 0x0001);
+        hci_transport_usb_add_device((uint16_t)g_usbVid, (uint16_t)g_usbPid);
 
         Post(L"BTstack: 初始化协议栈…");
         if (app_init()) {
             Post(L"BTstack: 初始化失败");
             return 1;
         }
+        // app_init() 内部会把 hci_dump 覆盖成 stdout 实例，这里必须重新指回文件实例，
+        // 否则 snoop 文件只有 0 字节（之前抓包一直为空就是这个原因）
+        hci_dump_init(hci_dump_windows_fs_get_instance());
         Post(L"BTstack: 协议栈就绪，上电…");
 
         // 轮询 GUI 指令（每 200ms）
