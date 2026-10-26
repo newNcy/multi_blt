@@ -297,9 +297,8 @@ static void VolumeSyncFromSystem()
 
 static void ConnectDev(const DevRec& d)
 {
-    // 已在推流的设备不重复建流（避免状态错乱）
-    const char* cur = BtSvcCurrentAddr();
-    if (cur[0] && _stricmp(cur, d.addrUtf8.c_str()) == 0 && BtSvcPhase() == 3) {
+    // 已在推流的设备不重复建流（避免状态错乱）——双路按地址判断
+    if (BtSvcIsStreamingAddr(d.addrUtf8.c_str())) {
         g_detailUtf8 = "该设备已在推流中，无需重复连接。";
         return;
     }
@@ -546,6 +545,21 @@ static void DrawRowIcon(int kind)
     ImGui::PopFont();
 }
 
+// 图标按钮：Font Awesome 字形 + 文字 tooltip
+// 宽度自适应（文字区 = 字形宽）：固定小方框会被 FramePadding(10px) 把文字区
+// 挤到 0 宽，字形被按钮裁切。height 0 = 当前行高。
+// （AllowWhenDisabled：禁用状态下 tooltip 依然可见，能解释为什么按钮点不了）
+static bool IconButton(const char* iconUtf8, const char* tip, ImVec2 size = ImVec2(0, 0))
+{
+    ImFont* f = g_fontIcon ? g_fontIcon : ImGui::GetFont();
+    ImGui::PushFont(f);
+    bool r = ImGui::Button(iconUtf8, size);
+    ImGui::PopFont();
+    if (tip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", tip);
+    return r;
+}
+
 static void DrawUI()
 {
     ImGuiIO& io = ImGui::GetIO();
@@ -624,9 +638,10 @@ static void DrawUI()
     {
         ImDrawList* dlBtn = ImGui::GetWindowDrawList();
         ImVec2 bpos = ImGui::GetCursorScreenPos();
-        ImVec2 bsz(84.0f, ImGui::GetFrameHeight());
+        // 宽度=字形(约12px)+左右padding(10+10)，保证放大镜/✕ 不被裁切
+        ImVec2 bsz(34.0f, ImGui::GetFrameHeight());
         if (scanning) {
-            // 扫描中：按钮背景 = 缓冲进度动画（黄绿高亮块循环扫过）
+            // 扫描中：按钮背景 = 缓冲进度动画（黄绿高亮块循环扫过），图标变 ✕（停止）
             float t = (float)ImGui::GetTime();
             dlBtn->AddRectFilled(bpos, ImVec2(bpos.x + bsz.x, bpos.y + bsz.y),
                                  ImGui::GetColorU32(ImVec4(0.110f, 0.110f, 0.133f, 1.0f)));
@@ -636,24 +651,24 @@ static void DrawUI()
             dlBtn->AddRectFilled(ImVec2(bpos.x + x, bpos.y), ImVec2(bpos.x + x + blockW, bpos.y + bsz.y),
                                  ImGui::GetColorU32(ImVec4(0.816f, 1.000f, 0.000f, 0.30f)));
             dlBtn->PopClipRect();
-            // 按钮本体透明，只留文字与边框
+            // 按钮本体透明，只留图标与边框
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0, 0, 0, 0));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0, 0, 0, 0));
-            if (ImGui::Button(scanning ? "停止扫描" : "扫描", bsz)) ScanToggle();
+            if (IconButton("\xEF\x80\x8D", "停止扫描", bsz)) ScanToggle();   // f00d xmark
             ImGui::PopStyleColor(3);
         } else {
-            // 待机：品牌荧光黄绿实心方角（flap CTA 风格）
+            // 待机：品牌荧光黄绿实心方角（flap CTA 风格），放大镜图标
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.816f, 1.000f, 0.000f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.878f, 1.000f, 0.196f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.700f, 0.878f, 0.000f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.027f, 0.031f, 0.031f, 1.0f));
-            if (ImGui::Button("扫描", bsz)) ScanToggle();
+            if (IconButton("\xEF\x80\x82", "扫描蓝牙设备", bsz)) ScanToggle(); // f002 magnifying-glass
             ImGui::PopStyleColor(4);
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("刷新", ImVec2(64, 0))) {
+    if (IconButton("\xEF\x80\xA1", "刷新适配器列表")) {   // f021 arrows-rotate
         unsigned cv = 0, cp = 0;
         BtSvcGetUsbDevice(cv, cp);
         g_adapters = AdapterEnumAll((uint16_t)cv, (uint16_t)cp);
@@ -663,7 +678,7 @@ static void DrawUI()
         bool occupied = g_adapterSel >= 0 && g_adapterSel < (int)g_adapters.size()
                         && !g_adapters[g_adapterSel].winusb;
         ImGui::BeginDisabled(!occupied);
-        if (ImGui::Button("切换驱动", ImVec2(100, 0))) {
+        if (IconButton("\xEF\x8B\x9B", "切换驱动（安装 WinUSB，供本软件使用）")) {   // f2db microchip
             if (g_adapterSel >= 0 && g_adapterSel < (int)g_adapters.size()) {
                 BtAdapter& a = g_adapters[g_adapterSel];
                 BtSvcStop();
@@ -685,10 +700,19 @@ static void DrawUI()
     ImGui::SameLine();
     {
         // 反向切换：选中的适配器当前是 WinUSB（归我们软件）→ 切回系统蓝牙
-        bool revertible = g_adapterSel >= 0 && g_adapterSel < (int)g_adapters.size()
-                          && g_adapters[g_adapterSel].winusb;
+        // 规则：另一台 dongle 已占用系统蓝牙时禁止切换 —— Windows 同时只支持
+        // 一块 bthusb 适配器（否则新切过去的会把已注册的无线电挤掉线）
+        bool valid2 = g_adapterSel >= 0 && g_adapterSel < (int)g_adapters.size();
+        bool btTakenByOther = false;
+        for (size_t k = 0; k < g_adapters.size(); ++k) {
+            if ((int)k != g_adapterSel && !g_adapters[k].winusb) { btTakenByOther = true; break; }
+        }
+        bool revertible = valid2 && g_adapters[g_adapterSel].winusb && !btTakenByOther;
         ImGui::BeginDisabled(!revertible);
-        if (ImGui::Button("切回系统蓝牙", ImVec2(120, 0))) {
+        const char* revertTip = !valid2            ? "切回系统蓝牙驱动"
+                              : btTakenByOther     ? "无法切回：另一台适配器已占用系统蓝牙\n（Windows 同时只支持一块蓝牙驱动，请先让它切回）"
+                              : "切回系统蓝牙驱动";
+        if (IconButton("\xEF\x87\xA6", revertTip)) {   // f1e6 plug
             if (g_adapterSel >= 0 && g_adapterSel < (int)g_adapters.size()) {
                 BtAdapter& a = g_adapters[g_adapterSel];
                 BtSvcStop();
@@ -742,7 +766,8 @@ static void DrawUI()
         }
         if (g_fontIcon) ImGui::PushFont(g_fontIcon);
         ImGui::SetNextItemWidth(46.0f);
-        if (ImGui::Button(capOn ? "\xEF\x80\x8C" : "\xEF\x80\x8B", ImVec2(46, 0))) CopyToggle();
+        // f04b play = EF 81 8B / f04c pause = EF 81 8C（之前写成 EF 80 8B/8C 是不存在的字形）
+        if (ImGui::Button(capOn ? "\xEF\x81\x8C" : "\xEF\x81\x8B", ImVec2(46, 0))) CopyToggle();
         if (g_fontIcon) ImGui::PopFont();
         if (!capOn) ImGui::PopStyleColor(4);
         if (ImGui::IsItemHovered())
@@ -799,11 +824,8 @@ static void DrawUI()
             ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0, 0, 0, 0));
             ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
             ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
-            bool rowStreaming = false;
-            {
-                const char* cur = BtSvcCurrentAddr();
-                rowStreaming = cur[0] && _stricmp(cur, d.addrUtf8.c_str()) == 0 && streaming;
-            }
+            // 双路：按设备地址独立判断（BtSvcCurrentAddr 只返回第一条活动流，双流时必错）
+            bool rowStreaming = BtSvcIsStreamingAddr(d.addrUtf8.c_str());
             if (ImGui::Selectable("##row", false,
                                   ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick))
             {
@@ -827,8 +849,7 @@ static void DrawUI()
                         BtSvcSetTestToneAddr(d.addrUtf8.c_str(), !ton);
                 }
                 ImGui::Separator();
-                bool isCur = BtSvcCurrentAddr()[0] &&
-                             _stricmp(BtSvcCurrentAddr(), d.addrUtf8.c_str()) == 0;
+                bool isCur = BtSvcIsStreamingAddr(d.addrUtf8.c_str());
                 ImGui::BeginDisabled(!streaming);
                 if (ImGui::MenuItem("断开")) BtSvcDisconnectAddr(d.addrUtf8.c_str());
                 ImGui::EndDisabled();
@@ -1164,7 +1185,7 @@ void ShowBtA2dpPanel(HWND parent)
                 0xf028, 0xf028,   // volume-high
                 0xf04b, 0xf04c,   // play / pause
                 0xf1e6, 0xf1e6,   // plug
-                0xf287, 0xf287,   // usb
+                0xf2db, 0xf2db,   // microchip（fa-usb 在 Brands 字体里，Solid 没有）
                 0xf6a9, 0xf6a9,   // volume-xmark
                 0
             };

@@ -7,15 +7,16 @@ call "%VCVARS%"
 if errorlevel 1 goto :vcfail
 if not exist build mkdir build
 if not exist build\bt mkdir build\bt
-copy /y "d:\dual blt\winusb\pkg\DualBltWinUSB.inf" build\ >nul 2>&1
-copy /y "d:\dual blt\winusb\cert.pfx" build\winusb_cert.pfx >nul 2>&1
-copy /y "d:\dual blt\assets\DualBlt.ico" build\ >nul 2>&1
-copy /y "d:\dual blt\assets\fa-solid-900.ttf" build\ >nul 2>&1
-copy /y "d:\dual blt\assets\ui.html" build\ >nul 2>&1
-copy /y "d:\dual blt\webview2\x64\WebView2Loader.dll" build\ >nul 2>&1
+rem 路径全部相对本脚本所在目录（仓库根），任何盘符/机器都能编
+copy /y "winusb\pkg\DualBltWinUSB.inf" build\ >nul 2>&1
+copy /y "winusb\cert.pfx" build\winusb_cert.pfx >nul 2>&1
+copy /y "assets\DualBlt.ico" build\ >nul 2>&1
+copy /y "assets\fa-solid-900.ttf" build\ >nul 2>&1
+copy /y "assets\ui.html" build\ >nul 2>&1
+copy /y "webview2\x64\WebView2Loader.dll" build\ >nul 2>&1
 
-set BTSTACK=d:\dual blt\third_party\btstack
-set PORT=d:\dual blt\btstack_port
+set BTSTACK=third_party\btstack
+set PORT=btstack_port
 set CFLAGS=/nologo /O2 /EHsc /std:c++17 /utf-8 /W3 /wd4819 /DNOMINMAX /D_UNICODE /DUNICODE
 
 echo --- GUI ---
@@ -58,8 +59,8 @@ if errorlevel 1 goto :fail
 echo --- GUI ---
 rem 注：src\btpanel3.cpp 为 WebView2 备用面板（未参与编译）。如需启用：
 rem   1) 在下行 sources 中加入 src\btpanel3.cpp
-rem   2) include 路径加 /I"d:\dual blt\webview2\include"
-rem   3) link 加 advapi32.lib "d:\dual blt\webview2\x64\WebView2LoaderStatic.lib"
+rem   2) include 路径加 /I"webview2\include"
+rem   3) link 加 advapi32.lib "webview2\x64\WebView2Loader.dll.lib"
 rem   4) gui.cpp 调用 ShowBtA2dpPanelWV(nullptr)
 rc /nologo /fo build\gui.res src\gui.rc
 cl %CFLAGS% /Fo:build\ /Fe:build\DualBlt.exe src\engine.cpp src\gui.cpp src\btpanel.cpp src\btcore.cpp src\btsvc.cpp src\btpanel2.cpp src\loopcap.cpp src\adapter.cpp build\gui.res ^
