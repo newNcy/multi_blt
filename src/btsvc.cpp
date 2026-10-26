@@ -8,6 +8,7 @@
 #include <string.h>
 #include <math.h>
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <map>
@@ -46,6 +47,10 @@
 static std::thread            g_thread;
 static std::atomic<bool>      g_running{ false };
 static std::atomic<bool>      g_exitReq{ false };
+static volatile bool          g_stopCleaned = false;   // 优雅停止已清理
+static volatile int           g_connBackoff = 0;       // 0x08 后退避计数（200ms 单位）
+static volatile DWORD         g_serviceStartTick = 0;  // 服务启动时刻（防撞车被动窗口）
+static volatile bool          g_passiveAfterDrop = false;   // 断开后进入被动：不再主动寻呼，等耳机回连（入站自动恢复）
 static BtSvcStatusFn          g_cb = nullptr;
 static BtSvcDeviceFn          g_devFn = nullptr;
 static void*                  g_cbUser = nullptr;
@@ -64,6 +69,8 @@ static std::atomic<bool>      g_cmdScan{ false };
 static std::atomic<bool>      g_cmdConnect{ false };
 static std::atomic<bool>      g_cmdPair{ false };
 static std::atomic<bool>      g_cmdDisconnect{ false };
+static char                   g_discAddr[32] = "";              // 按地址断开的目标
+static std::atomic<bool>      g_cmdDisconnectAddr{ false };     // 双路：只断该地址
 static std::atomic<DWORD>     g_disconnectTick{ 0 };   // 断开冷却：防止断开后立即误重连
 static char                   g_rejectAddr[32] = "";   // 用户刚断开的地址：拒绝其自动重连
 static std::atomic<DWORD>     g_rejectUntil{ 0 };
@@ -75,6 +82,8 @@ static char                   g_pendingAddr[8][32] = {};  // 串行化排队：�
 static int                    g_pendingCount = 0;
 static volatile bool          g_scanActive = false;
 static volatile bool          g_btUp = false;
+static int                    g_bootFails = 0;        // 连续启动失败计数（3 次提示拔插）
+static std::atomic<bool>      g_adapterDead{ false }; // 控制器挂死（UI 显示用）
 static std::atomic<bool>      g_runLoopUp{ false };   // run loop 是否存活（防跨线程误调用）
 static int                    app_state = 0;    // 0=扫描选设备 1=已连接/建流
 
@@ -134,11 +143,13 @@ typedef struct {
     uint16_t sbc_storage_count;
     uint8_t  sbc_ready_to_send;
     uint16_t avrcp_cid;
+    hci_con_handle_t acl_handle;         // 本路的 ACL 连接句柄
     double   phase;                  // 本路的消费位置（源帧单位）
     int      negRate;                // 本路协商采样率
     uint32_t pktCount;
     uint32_t byteCount;
     uint32_t dropCount;              // 发送未完成（缓冲满等）次数，保留数据待重试
+    volatile uint8_t testTone;       // 本路测试音开关（按设备隔离）
 } sending_ctx_t;
 
 static sending_ctx_t            media[NUM_STREAMS];
@@ -146,7 +157,7 @@ static btstack_sbc_encoder_bluedroid_t sbc_encoder_state[NUM_STREAMS];
 static const btstack_sbc_encoder_t * sbc_encoder_instance[NUM_STREAMS];
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 static avdtp_stream_endpoint_t * local_stream_endpoint[NUM_STREAMS];
-static hci_con_handle_t g_targetConHandle = HCI_CON_HANDLE_INVALID;
+// 双路：连接句柄按流（地址）记录，避免修 A 时误断 B 的 ACL
 
 static uint8_t sdp_a2dp_source_service_buffer[150];
 static uint8_t device_id_sdp_service_buffer[100];
@@ -186,6 +197,19 @@ static bool AnyStreamActive()
     for (int i = 0; i < NUM_STREAMS; ++i)
         if (media[i].a2dp_cid != 0 || media[i].stream_opened) return true;
     return false;
+}
+// 按地址取/清 ACL 句柄（双路安全：修 A 不会误断 B）
+static hci_con_handle_t HandleForAddr(const char* addr)
+{
+    if (!addr || !addr[0]) return HCI_CON_HANDLE_INVALID;
+    int i = FindStreamByAddr(addr);
+    if (i < 0) return HCI_CON_HANDLE_INVALID;
+    return media[i].acl_handle;
+}
+static void ClearHandleForAddr(const char* addr)
+{
+    int i = FindStreamByAddr(addr);
+    if (i >= 0) media[i].acl_handle = HCI_CON_HANDLE_INVALID;
 }
 // 是否有流还在建立中（信令已建但媒体流未开）—— btstack 的 SEP 发现一次只能跑一个，
 // 两副耳机必须串行建立：第一路完全就绪（进入推流）后才发起第二路
@@ -269,14 +293,12 @@ static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, u
 
     switch (packet[2]) {
     case AVRCP_SUBEVENT_PLAY_STATUS_QUERY: {
-        // 查询方未指明是哪路；用任一活跃的 avrcp_cid 应答
-        for (int i = 0; i < NUM_STREAMS; ++i) {
-            if (media[i].avrcp_cid) {
-                avrcp_target_play_status(media[i].avrcp_cid, play_info.song_length_ms,
-                                         play_info.song_position_ms, play_info.status);
-                break;
-            }
-        }
+        // 必须应答到"发问的那路"的 cid 上——双路时用错通道应答，
+        // 发问的耳机收不到 → 按"暂停"自我静音 → 两副耳机交替静音。
+        // 事件布局：[0]=meta [1]=len [2]=subevent [3..4]=avrcp_cid(小端)
+        uint16_t q = little_endian_read_16(packet, 3);
+        avrcp_target_play_status(q, play_info.song_length_ms,
+                                 play_info.song_position_ms, play_info.status);
         break;
     }
     default:
@@ -356,7 +378,7 @@ static void ProduceAudioIdx(int i, int16_t * pcm, int num_frames)
         media[i].phase = (double)(g_wpos.load() - (uint64_t)lo);
     }
 
-    if (g_testTone.load()) {
+    if (media[i].testTone) {
         static double phase = 0.0;
         static bool logged = false;
         int rate = media[i].negRate > 0 ? media[i].negRate : 44100;
@@ -473,10 +495,10 @@ static void audio_timeout(btstack_timer_source_t * ts)
     media[i].time_audio_data_sent = now;
     media[i].samples_ready += n;
 
-    // 每 5 秒记录一次（诊断）
-    static uint32_t lastLog = 0;
-    if (now - lastLog >= 5000) {
-        lastLog = now;
+    // 每 5 秒记录一次（诊断；lastLog 按路独立——共享会让两路日志互相顶名）
+    static uint32_t lastLog[NUM_STREAMS] = { 0, 0 };
+    if (now - lastLog[i] >= 5000) {
+        lastLog[i] = now;
         static uint32_t lastPkt[NUM_STREAMS] = { 0, 0 };
         uint32_t dpkt = media[i].pktCount - lastPkt[i];
         lastPkt[i] = media[i].pktCount;
@@ -496,7 +518,7 @@ static void audio_timeout(btstack_timer_source_t * ts)
     // 关键修复：不要发“编码后的静音”。流刚建立就持续发全零 SBC 帧，会让部分音箱
     // （如 K3）判定无信号而静音输出，之后即使真实音频到来也保持静音。
     // 没有测试音且 ring 里没有数据时保持静默不发，等真实音频到达再开始推流。
-    if (!g_testTone.load() && RingAvailableIdx(i) <= 0) {
+    if (!media[i].testTone && RingAvailableIdx(i) <= 0) {
         media[i].time_audio_data_sent = btstack_run_loop_get_time_ms();  // 防止补样累积
         return;
     }
@@ -524,11 +546,24 @@ static char                   g_retryAddr[32] = "";
 // 失败升级：切换到全新配对策略，断开残留链路，引擎会在下个周期自动执行
 static void schedule_retry(const char* addr)
 {
-    if (addr && addr[0]) strcpy_s(g_retryAddr, sizeof(g_retryAddr), addr);
+    // 非当前目标的旧尝试：只清理，不再重试（否则两个重试源互相打架，
+    // 建立的流被看门狗互相掐死）
+    if (addr && addr[0] && g_connectAddr[0] && _stricmp(addr, g_connectAddr) != 0) {
+        Post(L"BTstack: %S 的旧尝试放弃（当前目标 %S）", addr, g_connectAddr);
+        int i = FindStreamByAddr(addr);
+        if (i >= 0) {
+            media[i].a2dp_cid = 0;
+            media[i].addr[0] = 0;
+        }
+        return;
+    }
     g_strategy = 1;
-    if (g_targetConHandle != HCI_CON_HANDLE_INVALID) {
-        gap_disconnect(g_targetConHandle);
-        g_targetConHandle = HCI_CON_HANDLE_INVALID;
+    if (addr && addr[0]) {
+        hci_con_handle_t h = HandleForAddr(addr);
+        if (h != HCI_CON_HANDLE_INVALID) {
+            gap_disconnect(h);
+            ClearHandleForAddr(addr);
+        }
     }
     Post(L"BTstack: 连接失败，已切换策略：全新配对（自动）");
 }
@@ -543,7 +578,11 @@ static void start_streaming(int i)
     btstack_run_loop_remove_timer(&media[i].audio_timer);
     btstack_run_loop_set_timer_handler(&media[i].audio_timer, audio_timeout);
     btstack_run_loop_set_timer_context(&media[i].audio_timer, (void*)(intptr_t)i);
-    btstack_run_loop_set_timer(&media[i].audio_timer, AUDIO_TIMEOUT_MS);
+    // 相位错开：双路同时推流时，第二路偏移半个发送周期，
+    // 避免两路同一毫秒一起灌包把 dongle 缓冲打爆（偶发单边断音）
+    uint32_t first = AUDIO_TIMEOUT_MS;
+    if (i != 0 && AnyStreamStreaming()) first = AUDIO_TIMEOUT_MS / 2;
+    btstack_run_loop_set_timer(&media[i].audio_timer, first);
     btstack_run_loop_add_timer(&media[i].audio_timer);
 }
 
@@ -565,14 +604,29 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
         if (status != ERROR_CODE_SUCCESS) {
             Post(L"BTstack: A2DP 信令连接失败 status=0x%02x", status);
             // 0x0B = ACL 链路已存在：dongle 重启后残留了旧链路，先断开再重连
-            if (status == ERROR_CODE_ACL_CONNECTION_ALREADY_EXISTS
-                && g_targetConHandle != HCI_CON_HANDLE_INVALID) {
-                Post(L"BTstack: 检测到残留链路，断开后重连");
-                gap_disconnect(g_targetConHandle);
-                g_targetConHandle = HCI_CON_HANDLE_INVALID;
+            if (status == ERROR_CODE_ACL_CONNECTION_ALREADY_EXISTS) {
+                bd_addr_t ea;
+                a2dp_subevent_signaling_connection_established_get_bd_addr(packet, ea);
+                const char* es = bd_addr_to_str(ea);
+                hci_con_handle_t h = HandleForAddr(es);
+                if (h != HCI_CON_HANDLE_INVALID) {
+                    Post(L"BTstack: 检测到 %S 残留链路，断开后重连", es);
+                    gap_disconnect(h);
+                    ClearHandleForAddr(es);
+                }
             }
             int i = FindStreamByCid(cid);
             if (i >= 0) media[i].a2dp_cid = 0;
+            if (status == 0x81 || status == 0x04 || status == 0x08 || status == 0x1f) {
+                // 0x81 = SDP_QUERY_INCOMPLETE（对端忙，如 AirPods 被分时访问）
+                // 0x04/0x08 = 寻呼/连接超时（耳机暂时不在可连接状态）
+                // 0x1f = 本地中止（我们的看门狗掐的，QCY 首建流不应答属正常，
+                //        掐死后重试一次就通——绝不能升级到重配，否则删密钥死循环）
+                // 这些都是暂态问题，直连重试即可。引擎退避后自动重连。
+                g_connBackoff = (status == 0x08) ? 60 : 25;   // 12s / 5s
+                Post(L"BTstack: 连接失败 status=0x%02x（暂态），退避后自动重试", status);
+                break;
+            }
             schedule_retry(nullptr);
             break;
         }
@@ -639,11 +693,18 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
                  (int)a2dp_subevent_signaling_media_codec_sbc_configuration_get_min_bitpool_value(packet),
                  c.max_bitpool_value);
             sbc_encoder_instance[i] = btstack_sbc_encoder_bluedroid_init_instance(&sbc_encoder_state[i]);
+            // 双路稳定优先：编码码率封顶 bp40。耳机协商的 max（如 53）会让两路
+            // 合计逼近单 dongle 射频上限，偶发缓冲溢出 = 单边断音
+            int bp = c.max_bitpool_value;
+            if (bp > 40) {
+                Post(L"AVDTP[%d]: bitpool %d -> 40（双路射频余量）", i, bp);
+                bp = 40;
+            }
             sbc_encoder_instance[i]->configure(&sbc_encoder_state[i], SBC_MODE_STANDARD,
                                             c.block_length, c.subbands,
                                             c.allocation_method,
                                             c.sampling_frequency,
-                                            c.max_bitpool_value,
+                                            bp,
                                             c.channel_mode);
         }
         break;
@@ -673,6 +734,7 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
             g_phaseIdx.store(3);
             g_retries = 0;
             g_strategy = 0;
+            g_passiveAfterDrop = false;   // 已连接，清除被动状态
             Post(L"BTstack[%d]: 正在推流", i);
             int nStreaming = 0;
             for (int k = 0; k < NUM_STREAMS; ++k)
@@ -737,6 +799,12 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
         int i = FindStreamByCid(cid);
         Post(L"BTstack[%d]: A2DP 信令断开 cid=0x%04x", i, cid);
         if (i >= 0) {
+            // 断开后进入被动模式：不主动寻呼（耳机在盒子里寻呼只会空转），
+            // 耳机回连时入站连接自动恢复推流；用户再点连接则恢复主动
+            if (g_connectAddr[0] && _stricmp(media[i].addr, g_connectAddr) == 0) {
+                g_passiveAfterDrop = true;
+                Post(L"BTstack: 已进入被动等待（耳机回连自动恢复，不再主动寻呼）");
+            }
             media[i].a2dp_cid   = 0;
             media[i].stream_opened = 0;
             media[i].streaming  = 0;
@@ -756,8 +824,9 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
 // ------------------------------------------------------------ 链路密钥库（持久化到文件）
 // 配对成功一次就把密钥存盘；之后连接直接用密钥，不再配对 —— 和 Windows 一样秒连。
 
-struct LkEntry { link_key_t key; link_key_type_t type; };
+struct LkEntry { link_key_t key; link_key_type_t type; std::string nameUtf8; };   // 名字与密钥同存一行
 static std::map<std::string, LkEntry> g_lkMap;     // key: "XX:XX:XX:XX:XX:XX"
+static std::recursive_mutex g_lkLock;              // 密钥库串行化（UI 线程与栈线程并发访问）
 static const char * k_lkFile = "linkkeys.txt";
 
 // 状态文件统一放 exe 所在目录（避免从不同工作目录启动时读写分裂）
@@ -772,43 +841,82 @@ static std::string AppFile(const char* name)
 }
 static const std::string k_lkFilePath = AppFile("linkkeys.txt");
 
-static void LkLoad()
+// 解析密钥文件到 g_lkMap（返回条数）
+static unsigned LkParseFile(const char* path)
 {
-    g_lkMap.clear();
-    // 密钥完全来自持久化文件：首次用 SSP 全新配对生成并保存，之后免配对直连。
-    // （不内置 Windows 注册表导出的密钥 —— 那是加密 blob，不是明文，用不了。）
-
     FILE* f = nullptr;
-    if (fopen_s(&f, k_lkFilePath.c_str(), "r") != 0 || !f) return;
+    if (fopen_s(&f, path, "r") != 0 || !f) return 0;
     char line[256];
+    unsigned cnt = 0;
     while (fgets(line, sizeof(line), f)) {
-        char addr[24]; unsigned k[16]; unsigned t = 0;
-        int n = sscanf_s(line, "%23s %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %u",
-                         addr, (unsigned)sizeof(addr),
-                         &k[0],&k[1],&k[2],&k[3],&k[4],&k[5],&k[6],&k[7],
-                         &k[8],&k[9],&k[10],&k[11],&k[12],&k[13],&k[14],&k[15], &t);
-        if (n < 18) continue;
+        // 手动分词（MSVC 的 sscanf_s 禁用 %n，之前用它导致永远 loaded 0）
+        char* p = line;
+        auto NextTok = [&p]() -> char* {
+            while (*p == ' ' || *p == '\t') ++p;
+            char* s = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') ++p;
+            if (*p) { *p = 0; ++p; }
+            return s;
+        };
+        char* a = NextTok();
+        if (!a[0]) continue;
+        unsigned k[16];
+        bool ok = true;
+        for (int i = 0; i < 16; ++i) {
+            char* tk = NextTok();
+            if (!tk[0]) { ok = false; break; }
+            k[i] = strtoul(tk, nullptr, 16);
+        }
+        if (!ok) continue;
+        char* tt = NextTok();
+        if (!tt[0]) continue;
+        unsigned t = strtoul(tt, nullptr, 10);
         LkEntry e;
         for (int i = 0; i < 16; ++i) e.key[i] = (uint8_t)k[i];
         e.type = (link_key_type_t)t;
-        g_lkMap[addr] = e;
+        // 行尾设备名（\t 或空格后，到行尾）
+        while (*p == ' ' || *p == '\t') ++p;
+        for (; *p && *p != '\r' && *p != '\n'; ++p) e.nameUtf8.push_back(*p);
+        g_lkMap[a] = e;
+        ++cnt;
     }
     fclose(f);
-    char buf[64];
-    snprintf(buf, sizeof(buf), "loaded %u link keys", (unsigned)g_lkMap.size());
-    Post(L"BTstack: 密钥库 %S", buf);
+    return cnt;
+}
+
+
+static void LkSave();
+
+static void LkLoad()
+{
+    std::lock_guard<std::recursive_mutex> lk(g_lkLock);
+    g_lkMap.clear();
+    unsigned n = LkParseFile(k_lkFilePath.c_str());
+    Post(L"BTstack: 密钥库 loaded %u link keys", n);
+}
+
+static void LkWriteFile(const char* path)
+{
+    // 直写（不用临时文件）。写盘全部发生在事件时刻（配对成功/忘记设备），
+    // 都是几十字节的毫秒级操作且 fclose 同步落盘后才算完成——
+    // 关闭程序时没有任何挂起的写，不存在"写一半被杀"。
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || !f) return;
+    for (auto& kv : g_lkMap) {
+        fprintf(f, "%s", kv.first.c_str());
+        for (int i = 0; i < 16; ++i) fprintf(f, " %02x", kv.second.key[i]);
+        fprintf(f, " %u", (unsigned)kv.second.type);
+        if (!kv.second.nameUtf8.empty())
+            fprintf(f, "\t%s", kv.second.nameUtf8.c_str());
+        fprintf(f, "\n");
+    }
+    fclose(f);
 }
 
 static void LkSave()
 {
-    FILE* f = nullptr;
-    if (fopen_s(&f, k_lkFilePath.c_str(), "w") != 0 || !f) return;
-    for (auto& kv : g_lkMap) {
-        fprintf(f, "%s", kv.first.c_str());
-        for (int i = 0; i < 16; ++i) fprintf(f, " %02x", kv.second.key[i]);
-        fprintf(f, " %u\n", (unsigned)kv.second.type);
-    }
-    fclose(f);
+    std::lock_guard<std::recursive_mutex> lk(g_lkLock);
+    LkWriteFile(k_lkFilePath.c_str());
 }
 
 static std::string LkKeyStr(const bd_addr_t addr)
@@ -821,6 +929,7 @@ static std::string LkKeyStr(const bd_addr_t addr)
 
 static int lk_get(bd_addr_t addr, link_key_t key, link_key_type_t * type)
 {
+    std::lock_guard<std::recursive_mutex> lk(g_lkLock);
     auto it = g_lkMap.find(LkKeyStr(addr));
     if (it == g_lkMap.end()) return 0;
     memcpy(key, it->second.key, 16);
@@ -830,14 +939,15 @@ static int lk_get(bd_addr_t addr, link_key_t key, link_key_type_t * type)
 }
 static void lk_put(bd_addr_t addr, link_key_t key, link_key_type_t type)
 {
-    LkEntry e;
+    std::lock_guard<std::recursive_mutex> lk(g_lkLock);
+    // 就地更新密钥字段，保留原有名字（配对是重新协商密钥，不该清名字）
+    LkEntry& e = g_lkMap[LkKeyStr(addr)];
     memcpy(e.key, key, 16);
     e.type = type;
-    g_lkMap[LkKeyStr(addr)] = e;
     LkSave();
     Post(L"BTstack: 与 %S 配对成功，密钥已保存", LkKeyStr(addr).c_str());
 }
-static void lk_del(bd_addr_t addr) { g_lkMap.erase(LkKeyStr(addr)); LkSave(); }
+static void lk_del(bd_addr_t addr) { std::lock_guard<std::recursive_mutex> lk(g_lkLock); g_lkMap.erase(LkKeyStr(addr)); }   // 只删内存：文件保留最后成功状态，配对失败 LkLoad 即恢复
 static void lk_open(void) {}
 static void lk_close(void) {}
 static void lk_set_local(bd_addr_t a) {}
@@ -867,6 +977,8 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             return;
         }
         g_btUp = true;
+        g_bootFails = 0;       // 就绪事件到达：清零连续失败计数
+        g_adapterDead.store(false);   // 恢复：清除挂死标志
         bd_addr_t a;
         gap_local_bd_addr(a);
         Post(L"BTstack: 已启动 %S", bd_addr_to_str(a));
@@ -888,19 +1000,22 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
         return;
     }
 
-    // 记录与目标耳机的 ACL 连接句柄（0x0B=链路已存在时用它断开残留链路）
+    // 记录每个地址的 ACL 连接句柄（0x0B=链路已存在时用它断开残留链路）
     if (evt == HCI_EVENT_CONNECTION_COMPLETE) {
         bd_addr_t addr;
         hci_event_connection_complete_get_bd_addr(packet, addr);
         uint8_t st = hci_event_connection_complete_get_status(packet);
-        if (st == ERROR_CODE_SUCCESS && g_connectAddr[0]
-            && _stricmp(bd_addr_to_str(addr), g_connectAddr) == 0) {
-            g_targetConHandle = hci_event_connection_complete_get_connection_handle(packet);
+        if (st == ERROR_CODE_SUCCESS) {
+            int i = FindStreamByAddr(bd_addr_to_str(addr));
+            if (i >= 0)
+                media[i].acl_handle = hci_event_connection_complete_get_connection_handle(packet);
         }
         return;
     }
     if (evt == HCI_EVENT_DISCONNECTION_COMPLETE) {
-        g_targetConHandle = HCI_CON_HANDLE_INVALID;
+        uint16_t h = hci_event_disconnection_complete_get_connection_handle(packet);
+        for (int i = 0; i < NUM_STREAMS; ++i)
+            if (media[i].acl_handle == h) { media[i].acl_handle = HCI_CON_HANDLE_INVALID; break; }
         return;
     }
 
@@ -958,15 +1073,16 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             // 并停止自动循环，等用户重新触发
             g_inAutoRepair = false;
             Post(L"BTstack: 自动修复失败 status=0x%02x，已删除失效密钥", st);
-            BtSvcForgetDevice(g_connectAddr);
+            if (g_connectAddr[0]) {
+                Post(L"BTstack: \u5220\u9664\u5931\u6548\u5bc6\u94a5 %S", g_connectAddr);
+                BtSvcForgetDevice(g_connectAddr);
+            }
             g_connectAddr[0] = 0;
             g_phaseIdx.store(AnyStreamStreaming() ? 3 : 4);
         } else {
-            Post(L"BTstack: 配对失败 status=0x%02x，已恢复原密钥", st);
-            // 恢复配对前的密钥，避免失败把密钥弄丢。
-            // 耳机不在可连接状态（page 超时）时不放弃：引擎 15 秒后自动再试，
-            // 耳机一旦进入配对模式即自动接续。
-            CopyFileA(AppFile("linkkeys.bak").c_str(), k_lkFilePath.c_str(), FALSE);
+            Post(L"BTstack: 配对失败 status=0x%02x，重载密钥库（文件未动过）", st);
+            // lk_del 只删内存不删文件：文件里仍是最后成功配对的好密钥，
+            // 重载即恢复。耳机不在可连接状态时引擎稍后自动再试。
             LkLoad();
             g_phaseIdx.store(AnyStreamStreaming() ? 3 : 0);
         }
@@ -976,6 +1092,10 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
     if (evt == GAP_EVENT_INQUIRY_RESULT) {
         bd_addr_t addr;
         gap_event_inquiry_result_get_bd_addr(packet, addr);
+        // 过滤全零地址：已连接设备（如推流中的 QCY）会在扫描时产生地址为
+        // 00:00:00:00:00:00 的查询回声，进列表会变成"同名两行"
+        static const bd_addr_t kZero = { 0, 0, 0, 0, 0, 0 };
+        if (memcmp(addr, kZero, 6) == 0) return;
         uint32_t cod = gap_event_inquiry_result_get_class_of_device(packet);
         char name[240] = "";
         if (gap_event_inquiry_result_get_name_available(packet)) {
@@ -1029,6 +1149,29 @@ static void ClassicConnectCancel(const char* addr)
 
 static void poll_timer_handler(btstack_timer_source_t * ts)
 {
+    // 优雅停止：退出请求后先断流 + 断 ACL（400ms），再真正退出。
+    // 直接杀栈会让耳机异常掉线并疯狂自动重连，与新栈的寻呼撞车（0x08 超时）
+    if (g_exitReq.load()) {
+        if (!g_stopCleaned) {
+            g_stopCleaned = true;
+            for (int i = 0; i < NUM_STREAMS; ++i) {
+                if (media[i].a2dp_cid != 0) {
+                    Post(L"BTstack[%d]: 优雅停止：断开 A2DP", i);
+                    a2dp_source_disconnect(media[i].a2dp_cid);
+                }
+                if (media[i].acl_handle != HCI_CON_HANDLE_INVALID)
+                    gap_disconnect(media[i].acl_handle);
+            }
+            btstack_run_loop_set_timer(ts, 400);
+            btstack_run_loop_add_timer(ts);
+            return;
+        }
+        btstack_run_loop_trigger_exit();
+        return;
+    }
+
+    if (g_connBackoff > 0) g_connBackoff--;
+
     // 看门狗：上电后 15 秒仍未就绪（USB 打开失败后 btstack 不会自动重试），
     // 重启整个栈（线程循环会重建传输层再试）。就绪后本计数停止累计。
     // 注意：无论是否触发，都必须把定时器挂回去，否则轮询链断掉、看门狗失效。
@@ -1036,7 +1179,15 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
         static int bootTicks = 0;
         if (++bootTicks >= 75) {          // 75 * 200ms = 15s
             bootTicks = 0;
-            Post(L"BTstack: 15 秒未就绪（USB 打开失败），自动重试…");
+            if (++g_bootFails >= 3) {
+                g_bootFails = 0;
+                // 控制器固件挂死：USB 层活着但控制器不再应答 HCI，
+                // 栈重启救不了——必须物理拔插 dongle 断电复位
+                g_adapterDead.store(true);
+                Post(L"BTstack: 适配器控制器无响应（连续 3 次启动失败）。请拔插 dongle 后自动恢复。");
+            } else {
+                Post(L"BTstack: 15 秒未就绪（USB 打开失败），自动重试…");
+            }
             btstack_run_loop_set_timer(ts, 200);
             btstack_run_loop_add_timer(ts);
             g_restartReq.store(true);
@@ -1044,6 +1195,15 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
             return;
         }
     }
+    // 异步就绪门控：BTSTACK_EVENT_STATE（HCI 上电完成事件）未到前，
+    // 不向控制器发任何命令——所有命令保持排队，就绪后下一拍自动执行。
+    // （之前栈未上电就发 establish → 0x0c 命令不允许风暴）
+    if (!g_btUp) {
+        btstack_run_loop_set_timer(ts, 200);
+        btstack_run_loop_add_timer(ts);
+        return;
+    }
+
     // 配对成功后延迟建流（等 dedicated bonding 的链路彻底断开）
     if (g_pairDelayConnect) {
         if (++g_pairDelayTicks >= 12) {   // 12 * 200ms = 2.4s
@@ -1056,16 +1216,18 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
     {
         if (++g_engineTick >= 25) {       // 25 * 200ms = 5s
             g_engineTick = 0;
-            if (g_connectAddr[0] && !AnyStreamActive() && !g_pairing && !g_pairForce
+            if (g_connBackoff > 0) { /* 0x08 退避中：暂停寻呼，让对方入站重连落到栈上 */ }
+            else if (g_passiveAfterDrop) { /* 断开后被动等待：耳机回连自动恢复，不主动寻呼 */ }
+            else if (g_connectAddr[0] && !AnyStreamActive() && !g_pairing && !g_pairForce
                 && !g_pairDelayConnect && !g_inAutoRepair) {
                 g_phaseIdx.store(2);
                 if (g_strategy == 1) {
-                    // 策略1：全新配对（配对失败=耳机不在，冷却 15s 后自动再试；
+                    // 策略1：全新配对（配对失败=耳机不在，冷却 5s 后自动再试；
                     // 耳机一旦进入配对模式即自动接续）
                     static int bondCd = 0;
                     if (bondCd > 0) { bondCd--; }
                     else {
-                        bondCd = 75;      // 15s 冷却
+                        bondCd = 25;      // 5s 冷却
                         Post(L"BTstack[引擎]: 全新配对 %S（耳机进配对模式即自动接续）", g_connectAddr);
                         g_pairForce = true;
                         g_pairTicks = 0;
@@ -1098,6 +1260,35 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
             Post(L"BTstack: 扫描请求已排队，等待适配器就绪…");
         }
     }
+    // 按地址断开（双路）：只断选中的那路，另一路不受影响
+    if (g_cmdDisconnectAddr.exchange(false)) {
+        int i = FindStreamByAddr(g_discAddr);
+        if (i >= 0) {
+            Post(L"BTstack[%d]: 断开 %S（单路）", i, g_discAddr);
+            if (media[i].a2dp_cid != 0)
+                a2dp_source_disconnect(media[i].a2dp_cid);
+            if (media[i].acl_handle != HCI_CON_HANDLE_INVALID) {
+                gap_disconnect(media[i].acl_handle);
+                media[i].acl_handle = HCI_CON_HANDLE_INVALID;
+            }
+            btstack_run_loop_remove_timer(&media[i].audio_timer);
+            media[i].a2dp_cid = 0;
+            media[i].stream_opened = 0;
+            media[i].streaming = 0;
+            media[i].addr[0] = 0;
+            // 该地址进入短拒绝窗，防它秒回连
+            strcpy_s(g_rejectAddr, sizeof(g_rejectAddr), g_discAddr);
+            g_rejectUntil.store(GetTickCount() + 8000);
+            // 若正是当前目标：清目标并进入被动
+            if (g_connectAddr[0] && _stricmp(g_connectAddr, g_discAddr) == 0) {
+                g_connectAddr[0] = 0;
+                g_passiveAfterDrop = true;
+            }
+            g_phaseIdx.store(AnyStreamStreaming() ? 3 : 0);
+        }
+        g_discAddr[0] = 0;
+    }
+
     if (g_cmdDisconnect.exchange(false)) {
         for (int i = 0; i < NUM_STREAMS; ++i) {
             if (media[i].a2dp_cid != 0) {
@@ -1147,10 +1338,13 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
     // inquiry 停止后延迟几轮再发起配对，避免控制器忙导致 page 发不出
     if (g_pairForce) {
         // 先断开与目标的残留 ACL（0x0b：链路已存在会直接导致配对失败）
-        if (g_targetConHandle != HCI_CON_HANDLE_INVALID) {
-            gap_disconnect(g_targetConHandle);
-            g_targetConHandle = HCI_CON_HANDLE_INVALID;
-            g_pairTicks = 0;            // 断开后再等一轮，让链路干净
+        // 双路安全：只断当前配对目标的句柄，不碰另一副耳机的链路
+        hci_con_handle_t th = HandleForAddr(g_connectAddr);
+        if (th != HCI_CON_HANDLE_INVALID) {
+            Post(L"BTstack: \u65ad\u5f00\u6b8b\u7559 ACL\uff0c\u591a\u7b49 2s");
+            gap_disconnect(th);
+            ClearHandleForAddr(g_connectAddr);
+            g_pairTicks = -8;           // 断开后多等约 2s，让链路彻底干净（0x0b 防护）
             btstack_run_loop_set_timer(ts, 200);
             btstack_run_loop_add_timer(ts);
             return;
@@ -1162,7 +1356,7 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
             gap_inquiry_stop();
             g_phaseIdx.store(2);
             // 备份密钥：dedicated bonding 会先删密钥，若配对失败则恢复，避免密钥反复丢失
-            CopyFileA(k_lkFilePath.c_str(), AppFile("linkkeys.bak").c_str(), FALSE);
+            
             bd_addr_t target;
             sscanf_bd_addr(g_connectAddr, target);
             int r = gap_dedicated_bonding(target, 0);   // mitm=0 -> Just Works
@@ -1181,22 +1375,31 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
         Post(L"BTstack: 上一路已就绪，开始连接下一路 %S", pend);
     }
 
-    // 建流卡死看门狗：有流在建立中超过 45 秒（耳机对媒体通道不应答等），
-    // 强制断开该流并自动重试，专治耳机抽风
+    // 建流卡死看门狗：建立中的流超过限时（空闲 15s / 推流中 40s），
+    // 断开并交由引擎按当前目标重试。只杀当前目标的流；旧目标的残留流直接清理
     static int setupTicks = 0;
     if (AnyStreamInSetup() && !g_pairing) {
-        if (++setupTicks >= 225) {       // 225 * 200ms = 45s
+        int limit = AnyStreamStreaming() ? 200 : 75;
+        if (++setupTicks >= limit) {
             setupTicks = 0;
             for (int i = 0; i < NUM_STREAMS; ++i) {
                 if (media[i].a2dp_cid != 0 && !media[i].stream_opened) {
-                    Post(L"BTstack[%d]: 建流 45 秒无进展，断开重试…", i);
+                    bool isTarget = g_connectAddr[0] &&
+                                    _stricmp(media[i].addr, g_connectAddr) == 0;
+                    Post(L"BTstack[%d]: 建流超时（%d秒），断开重试…", i, limit / 5);
                     // 先撤销底层 create_connection：超时常因为 ACL 一直没完成
                     // （对端不应答 page），不撤销的话悬空 page 会占住基带，
                     // 之后的重试连不上、扫描也扫不出任何设备
                     ClassicConnectCancel(media[i].addr);
                     a2dp_source_disconnect(media[i].a2dp_cid);
                     media[i].a2dp_cid = 0;
-                    schedule_retry(media[i].addr);
+                    if (!isTarget) {
+                        // 旧目标的残留：清理掉，不再重试（避免与当前目标打架）
+                        Post(L"BTstack[%d]: %S 的旧尝试放弃（当前目标 %S）",
+                             i, media[i].addr, g_connectAddr);
+                        media[i].addr[0] = 0;
+                    }
+                    // 当前目标：不清 addr，引擎按现有策略 5 秒后自动重试
                 }
             }
         }
@@ -1219,10 +1422,29 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
             g_passiveMode = false;
             gap_inquiry_stop();
             app_state = 1;
-            g_phaseIdx.store(2);
+            // 已有路在推流时不降级全局状态（推流中+连接第二路并行）
+            if (!AnyStreamStreaming()) g_phaseIdx.store(2);
             g_pairing = false;
             g_rejectAddr[0] = 0;            // 用户主动连接：撤销拒绝名单
             g_rejectUntil.store(0);
+
+            // 用户点了新设备 = 用户意图最高优先级：
+            // 1) 清空排队队列（里面的旧目标不再自动接续）
+            if (g_pendingCount > 0) {
+                Post(L"BTstack: 清空 %d 个排队连接（用户改连 %S）", g_pendingCount, g_connectAddr);
+                g_pendingCount = 0;
+            }
+            // 2) 取消其它地址正在建立中的流（半截 establish 会让用户点的设备排队干等）
+            for (int k = 0; k < NUM_STREAMS; ++k) {
+                if (media[k].a2dp_cid != 0 && !media[k].stream_opened
+                    && _stricmp(media[k].addr, g_connectAddr) != 0) {
+                    Post(L"BTstack[%d]: 取消 %S 的建立（用户改连 %S）", k, media[k].addr, g_connectAddr);
+                    ClassicConnectCancel(media[k].addr);
+                    a2dp_source_disconnect(media[k].a2dp_cid);
+                    media[k].a2dp_cid = 0;
+                    media[k].addr[0] = 0;
+                }
+            }
 
             // 多路：已有此地址的流 → 复用；否则找空闲流
             int i = FindStreamByAddr(g_connectAddr);
@@ -1230,10 +1452,21 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
                 // 该地址已在推流：不重复建流，仅恢复状态显示
                 Post(L"BTstack[%d]: %S 已在推流，忽略重复连接", i, g_connectAddr);
                 g_phaseIdx.store(3);
+            } else if (i >= 0 && media[i].a2dp_cid != 0 && !media[i].stream_opened) {
+                // 该地址已在建立中：忽略重复点击（重启建立会饿死 5s 看门狗）
+                Post(L"BTstack[%d]: %S 已在连接中，忽略重复点击", i, g_connectAddr);
+                g_phaseIdx.store(2);
             } else {
             if (i < 0) i = FindFreeStream();
             if (i < 0) {
                 Post(L"BTstack: 所有推流通道已占用（上限 %d 路，断开一些再连）", NUM_STREAMS);
+            } else if (g_pairing || g_pairForce) {
+                // 配对进行中：establish 会与 bonding 抢链路（互相污染），排队等配对结束
+                if (g_pendingCount < 8) {
+                    strcpy_s(g_pendingAddr[g_pendingCount], 32, g_connectAddr);
+                    g_pendingCount++;
+                    Post(L"BTstack: 配对进行中，%S 已排队，配对结束后自动连接", g_connectAddr);
+                }
             } else if (AnyStreamInSetup() && FindStreamByAddr(g_connectAddr) != i) {
                 // 串行化：有流正在建立中，后续路排队等待（避免 btstack SEP 发现并发断言）
                 if (g_pendingCount < 8) {
@@ -1243,6 +1476,13 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
                 } else {
                     Post(L"BTstack: 排队已满，%S 的连接请求被忽略", g_connectAddr);
                 }
+            } else if (!BtSvcIsPaired(g_connectAddr)) {
+                // 没有密钥：直连必踩 PIN 陷阱（耳机有旧绑定）→ 直接全新配对，
+                // 省掉"直连失败 0x66 → 升级"的整轮浪费
+                Post(L"BTstack: %S 无密钥，直接全新配对", g_connectAddr);
+                g_strategy = 1;
+                g_pairForce = true;
+                g_pairTicks = 0;
             } else {
                 // 若该流还有残留信令连接，先清掉再建，避免 establish 返回 cid=0
                 if (media[i].a2dp_cid != 0 && !media[i].stream_opened) {
@@ -1370,6 +1610,13 @@ void BtSvcConnect(const char* addr)
 {
     if (!g_thread.joinable() || !addr) return;
     strcpy_s(g_connectAddr, sizeof(g_connectAddr), addr);
+    g_passiveAfterDrop = false;   // 用户点击 = 主动意图，解除被动等待
+    // 防撞车：重启后 15 秒内点已配对设备，先给 3 秒被动窗口——
+    // TWS 耳机断开后会立刻回连我们（入站），等它落进来比双向寻呼对撞快且稳；
+    // 3 秒没等到（耳机不在回连状态），引擎照常主动寻呼
+    DWORD up = GetTickCount() - g_serviceStartTick;
+    if (up < 15000 && BtSvcIsPaired(addr) && g_connBackoff < 15)
+        g_connBackoff = 15;   // 3 秒被动窗口
     g_cmdConnect.store(true);
 }
 
@@ -1381,6 +1628,15 @@ void BtSvcDisconnect()
     g_cmdDisconnect.store(true);
 }
 
+// 按地址断开（双路：点谁断谁，另一路不动）——声明见命令标志区
+void BtSvcDisconnectAddr(const char* addr)
+{
+    if (!g_thread.joinable() || !addr || !addr[0]) return;
+    strcpy_s(g_discAddr, sizeof(g_discAddr), addr);
+    g_disconnectTick.store(GetTickCount());
+    g_cmdDisconnectAddr.store(true);
+}
+
 void BtSvcPair(const char* addr)
 {
     if (!g_thread.joinable() || !addr) return;
@@ -1388,44 +1644,58 @@ void BtSvcPair(const char* addr)
     g_cmdPair.store(true);
 }
 
+// 设置已配对设备的名字（与密钥同文件存储）
+bool BtSvcSetName(const char* addr, const char* nameUtf8)
+{
+    if (!addr || !addr[0] || !nameUtf8) return false;
+    std::lock_guard<std::recursive_mutex> lk(g_lkLock);
+    // 线程未跑时内存库可能没加载：先从文件刷一遍
+    if (g_lkMap.empty()) {
+        g_lkMap.clear();
+        LkParseFile(k_lkFilePath.c_str());
+    }
+    char up[32] = "";
+    for (int i = 0; addr[i] && i < 31; ++i)
+        up[i] = (char)toupper((unsigned char)addr[i]);
+    auto it = g_lkMap.find(up);
+    if (it == g_lkMap.end()) return false;
+    // 幂等：名字没变就不写盘（面板每 500ms 同步一次，靠这个挡住无谓 IO）
+    if (it->second.nameUtf8 == nameUtf8) return true;
+    it->second.nameUtf8 = nameUtf8;
+    LkWriteFile(k_lkFilePath.c_str());
+    return true;
+}
+
+// 枚举已配对设备（addr/name 均为 UTF-8）
+void BtSvcEnumPaired(void (*cb)(const char* addr, const char* nameUtf8, void* user), void* user)
+{
+    std::lock_guard<std::recursive_mutex> lk(g_lkLock);
+    if (g_lkMap.empty()) {
+        g_lkMap.clear();
+        LkParseFile(k_lkFilePath.c_str());
+    }
+    for (auto& kv : g_lkMap)
+        cb(kv.first.c_str(), kv.second.nameUtf8.c_str(), user);
+}
+
 bool BtSvcIsPaired(const char* addr)
 {
     if (!addr || !addr[0]) return false;
-    FILE* f = nullptr;
-    if (fopen_s(&f, k_lkFilePath.c_str(), "r") != 0 || !f) return false;
-    char line[256];
-    bool found = false;
-    while (fgets(line, sizeof(line), f)) {
-        char a[32] = "";
-        if (sscanf_s(line, "%31s", a, (unsigned)sizeof(a)) == 1
-            && _stricmp(a, addr) == 0) { found = true; break; }
-    }
-    fclose(f);
-    return found;
+    std::lock_guard<std::recursive_mutex> lk(g_lkLock);
+    // 查内存密钥库（与栈实际用于鉴权的密钥一致，避免文件/内存不同步导致误判）
+    char up[32] = "";
+    for (int i = 0; addr[i] && i < 31; ++i)
+        up[i] = (char)toupper((unsigned char)addr[i]);
+    return g_lkMap.find(up) != g_lkMap.end();
 }
 
 void BtSvcForgetDevice(const char* addr)
 {
     if (!addr || !addr[0]) return;
-    // 从 linkkeys.txt 删除该地址
-    FILE* f = nullptr;
-    if (fopen_s(&f, k_lkFilePath.c_str(), "r") == 0 && f) {
-        std::vector<std::string> keep;
-        char line[256];
-        while (fgets(line, sizeof(line), f)) {
-            char a[32] = "";
-            if (sscanf_s(line, "%31s", a, (unsigned)sizeof(a)) == 1
-                && _stricmp(a, addr) == 0) continue;   // 跳过要删的
-            keep.push_back(line);
-        }
-        fclose(f);
-        if (fopen_s(&f, k_lkFilePath.c_str(), "w") == 0 && f) {
-            for (auto& l : keep) fputs(l.c_str(), f);
-            fclose(f);
-        }
-    }
-    // 内存里的也删
+    std::lock_guard<std::recursive_mutex> lk(g_lkLock);
+    // 内存删除 + 整体重写文件（单一数据源，锁内串行）
     g_lkMap.erase(addr);
+    LkSave();
     // 清掉自动重连目标，否则会继续无密钥重连并干扰扫描
     if (g_connectAddr[0] && _stricmp(g_connectAddr, addr) == 0) {
         g_connectAddr[0] = 0;
@@ -1436,8 +1706,22 @@ void BtSvcForgetDevice(const char* addr)
 
 void BtSvcSetTestTone(bool on)
 {
-    g_testTone.store(on);
-    Post(L"BTstack: 测试音 = %s", on ? L"开" : L"关");
+    // 全局开关（兼容旧入口）：作用于所有路
+    for (int i = 0; i < NUM_STREAMS; ++i) media[i].testTone = on ? 1 : 0;
+    Post(L"BTstack: 测试音（全部）= %s", on ? L"开" : L"关");
+}
+
+// 按设备测试音：只开关指定地址的那一路
+bool BtSvcTestToneAddr(const char* addr)
+{
+    int i = FindStreamByAddr(addr);
+    return i >= 0 && media[i].testTone != 0;
+}
+
+void BtSvcSetTestToneAddr(const char* addr, bool on)
+{
+    int i = FindStreamByAddr(addr);
+    if (i >= 0) media[i].testTone = on ? 1 : 0;
 }
 
 void BtSvcSetGain(float gain)
@@ -1496,9 +1780,10 @@ void BtSvcStop()
 {
     if (!g_thread.joinable()) return;
     g_exitReq.store(true);
-    if (g_runLoopUp.load())
-        btstack_run_loop_trigger_exit();   // 仅当 run loop 存活时才触发
-    // 限时等待：线程若卡在 USB 层，超时分离，避免 UI 冻结
+    // 不直接 trigger_exit！优雅停止由 poll 定时器完成：
+    //   第一拍：断 A2DP 流 + 断 ACL（耳机看到正常断开，不触发疯狂重连）
+    //   第二拍（400ms 后）：btstack_run_loop_trigger_exit
+    // 若 run loop 已不在（USB 卡死等），3 秒超时分离兜底。
     HANDLE h = g_thread.native_handle();
     if (WaitForSingleObject(h, 3000) == WAIT_OBJECT_0) {
         g_thread.join();
@@ -1513,6 +1798,17 @@ void BtSvcStop()
 bool BtSvcRunning() { return g_running.load(); }
 bool BtSvcScanActive() { return g_scanActive; }
 int  BtSvcPhase() { return g_phaseIdx.load(); }
+bool BtSvcAdapterDead() { return g_adapterDead.load(); }
+bool BtSvcIsStreamingAddr(const char* addr)
+{
+    int i = FindStreamByAddr(addr);
+    return i >= 0 && media[i].stream_opened && media[i].streaming;
+}
+bool BtSvcIsConnectingAddr(const char* addr)
+{
+    int i = FindStreamByAddr(addr);
+    return i >= 0 && media[i].a2dp_cid != 0 && !media[i].stream_opened;
+}
 bool BtSvcThreadActive() { return g_thread.joinable(); }
 bool BtSvcTestTone() { return g_testTone.load(); }
 
@@ -1535,7 +1831,9 @@ void BtSvcFeedAudio(const short* pcm, int frames, int feedRate)
 
 static DWORD WINAPI BtThread(LPVOID)
 {
+    g_serviceStartTick = GetTickCount();   // 服务启动时刻（防撞车被动窗口用）
     while (!g_exitReq.load()) {
+        g_stopCleaned = false;
         LkLoad();                    // 每次栈重建都重新加载持久化密钥
         btstack_memory_init();
         btstack_run_loop_init(btstack_run_loop_windows_get_instance());

@@ -1,0 +1,3 @@
+// DualBlt.exe 资源：嵌入管理员清单（requireAdministrator）
+#include <winnt.h>
+1 24 "app.manifest"

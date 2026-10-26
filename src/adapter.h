@@ -19,6 +19,7 @@ struct BtAdapter {
     uint16_t pid = 0;
     bool winusb = false;       // true = 可直接使用
     bool isBluetooth = false;  // 已确认是蓝牙适配器（E0/01/01）
+    unsigned problemCode = 0;  // 非零 = 驱动异常（CM 问题码）
 };
 
 // 枚举系统中所有 USB 蓝牙适配器（去重：同一设备多个接口只留一条，优先 WinUSB）
@@ -28,3 +29,10 @@ std::vector<BtAdapter> AdapterEnumAll(uint16_t curVid = 0, uint16_t curPid = 0);
 // 为指定 VID/PID 生成动态 INF（复制自模板并替换硬件 ID）
 // 返回 false = 模板不存在
 bool AdapterWriteInf(uint16_t vid, uint16_t pid, std::wstring& outInfPath);
+
+// 按设备实例精准切换驱动（需管理员，GUI 清单已 requireAdministrator）
+// toWinUSB=true  → 安装本程序 WinUSB 驱动到该实例
+// toWinUSB=false → 切回系统蓝牙（收件箱 bthusb.inf）
+// 返回 false 时 err 带原因
+bool AdapterSwitchDriver(const std::wstring& instanceId, uint16_t vid, uint16_t pid,
+                         bool toWinUSB, std::wstring& err);

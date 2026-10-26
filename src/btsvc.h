@@ -28,6 +28,7 @@ void BtSvcConnect(const char* addr);
 
 // 断开当前 A2DP 流（保留服务，可再次连接）
 void BtSvcDisconnect();
+void BtSvcDisconnectAddr(const char* addr);   // 双路：只断该地址，另一路不动
 
 // 进入被动等待配对模式：保持可发现可连接，等耳机主动连入（SSP 更易成功）
 void BtSvcWaitPairing();
@@ -48,6 +49,15 @@ bool BtSvcScanActive();
 
 // 当前阶段：0=待机 1=扫描中 2=连接中 3=推流中 4=失败
 int BtSvcPhase();
+bool BtSvcAdapterDead();   // 控制器挂死（需拔插 dongle），UI 显示用
+
+// 按地址查询（双路：每台设备独立状态）
+bool BtSvcIsStreamingAddr(const char* addr);   // 该地址正在推流
+bool BtSvcIsConnectingAddr(const char* addr);  // 该地址正在建立
+
+// 已配对设备管理（名字与密钥同存 linkkeys.txt 单文件）
+bool BtSvcSetName(const char* addr, const char* nameUtf8);   // 设置设备名
+void BtSvcEnumPaired(void (*cb)(const char* addr, const char* nameUtf8, void* user), void* user);
 
 // BTstack 线程是否存活
 bool BtSvcThreadActive();
@@ -58,6 +68,8 @@ void BtSvcFeedAudio(const short* pcm, int frames, int feedRate);
 
 // 是否用内置测试音代替真实音频（验证链路用）
 void BtSvcSetTestTone(bool on);
+bool BtSvcTestToneAddr(const char* addr);      // 按设备：该路测试音状态
+void BtSvcSetTestToneAddr(const char* addr, bool on);   // 按设备：只开关该路
 bool BtSvcTestTone();
 
 // 推流音量（软件增益，作用于编码前的 PCM，1.0 = 原始电平，0 = 静音）

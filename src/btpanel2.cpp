@@ -13,6 +13,20 @@
 
 #include <windows.h>
 #include <dwmapi.h>
+
+// 旧 SDK（VS2019 自带）缺少的 DWM 属性常量，手动补齐
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+#ifndef DWMWA_CAPTION_COLOR
+#define DWMWA_CAPTION_COLOR 35
+#endif
+#ifndef DWMWA_TEXT_COLOR
+#define DWMWA_TEXT_COLOR 36
+#endif
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <string>
@@ -125,20 +139,38 @@ static void DeviceCb(const char* addr, const char* name, unsigned cod, void* use
 
 // ------------------------------------------------------------ 配对名单持久化
 
+// 待补名字队列：点击时设备未配对 → 等配对完成的第一刻写入密钥行
+static std::vector<std::pair<std::string, std::string>> g_pendingNames;
+
 static void SavePairedName(const std::wstring& addr, const std::wstring& name)
 {
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, AppFileW(L"paired_names.txt").c_str(), L"a, ccs=UTF-8") != 0 || !f) return;
-    fwprintf(f, L"%s\t%s\n", addr.c_str(), name.c_str());
-    fclose(f);
+    // 名字与密钥同存 linkkeys.txt。点击时设备往往还没配对——先尝试直接写，
+    // 不行就进待补队列，配对完成的第一刻（500ms 内）写入密钥行
+    std::string a = WideToUtf8(addr), n = WideToUtf8(name);
+    if (!BtSvcSetName(a.c_str(), n.c_str())) {
+        for (auto& p : g_pendingNames)
+            if (p.first == a) { p.second = n; return; }
+        g_pendingNames.push_back({ a, n });
+    }
+}
+
+static void EnumPairedCb(const char* addr, const char* nameUtf8, void* user)
+{
+    auto* out = (std::vector<std::pair<std::string, std::string>>*)user;
+    out->emplace_back(addr, nameUtf8 ? nameUtf8 : "");
 }
 
 static void LoadPairedDevices()
 {
-    // 名单
-    std::map<std::wstring, std::wstring> names;
+    // 单文件：密钥 + 名字都在 linkkeys.txt（服务 API 加锁读取）
+    std::vector<std::pair<std::string, std::string>> list;
+    BtSvcEnumPaired(EnumPairedCb, &list);
+
+    // 一次性迁移：旧 paired_names.txt 里的名字并入单文件后废弃
+    std::map<std::wstring, std::wstring> oldNames;
     FILE* nf = nullptr;
-    if (_wfopen_s(&nf, AppFileW(L"paired_names.txt").c_str(), L"r, ccs=UTF-8") == 0 && nf) {
+    std::wstring oldPath = AppFileW(L"paired_names.txt");
+    if (_wfopen_s(&nf, oldPath.c_str(), L"r, ccs=UTF-8") == 0 && nf) {
         wchar_t line[256];
         while (fgetws(line, 256, nf)) {
             wchar_t* tab = wcschr(line, L'\t');
@@ -146,36 +178,36 @@ static void LoadPairedDevices()
             *tab = 0;
             wchar_t* e = wcschr(tab + 1, L'\n');
             if (e) *e = 0;
-            names[line] = tab + 1;
+            oldNames[line] = tab + 1;
         }
         fclose(nf);
     }
-    // 密钥
-    FILE* kf = nullptr;
-    if (_wfopen_s(&kf, AppFileW(L"linkkeys.txt").c_str(), L"r") != 0 || !kf) return;
-    char line[256];
-    while (fgets(line, 256, kf)) {
-        char a[32] = "";
-        if (sscanf_s(line, "%31s", a, (unsigned)sizeof(a)) != 1) continue;
-        if (!a[0]) continue;
-        wchar_t waddr[32];
-        MultiByteToWideChar(CP_ACP, 0, a, -1, waddr, 32);
-        std::wstring key = waddr;
+    bool migrated = false;
+
+    for (auto& kv : list) {
+        std::wstring key = Utf8ToWide(kv.first);
         if (g_devs.count(key)) continue;
 
         DevRec d;
         d.addr = key;
-        int nb = WideCharToMultiByte(CP_UTF8, 0, waddr, -1, nullptr, 0, nullptr, nullptr);
-        d.addrUtf8.resize(nb, 0);
-        WideCharToMultiByte(CP_UTF8, 0, waddr, -1, &d.addrUtf8[0], nb, nullptr, nullptr);
-        auto itn = names.find(key);
-        std::wstring nm = (itn != names.end()) ? itn->second : L"(已配对设备)";
-        d.nameUtf8 = WideToUtf8(nm);
+        d.addrUtf8 = kv.first;
+        std::string nmUtf8 = kv.second;
+        if (nmUtf8.empty()) {
+            auto itn = oldNames.find(key);
+            if (itn != oldNames.end()) {
+                nmUtf8 = WideToUtf8(itn->second);
+                if (BtSvcSetName(kv.first.c_str(), nmUtf8.c_str())) migrated = true;
+            }
+        }
+        if (nmUtf8.empty()) nmUtf8 = "(已配对设备)";
+        d.nameUtf8 = nmUtf8;
         d.cod = 0x240404;
         d.statusUtf8 = "已配对";
         g_devs[key] = d;
     }
-    fclose(kf);
+    // 迁移完成：旧文件改名归档，避免重复处理
+    if (migrated || !oldNames.empty())
+        MoveFileW(oldPath.c_str(), (oldPath + L".migrated").c_str());
 }
 
 // ------------------------------------------------------------ 音量（系统端点音量，双向同步）
@@ -271,6 +303,9 @@ static void ConnectDev(const DevRec& d)
         g_detailUtf8 = "该设备已在推流中，无需重复连接。";
         return;
     }
+    // 设备带真名 → 先尝试写密钥行；未配对则进待补队列（配对完成即写）
+    if (!d.nameUtf8.empty())
+        SavePairedName(d.addr, Utf8ToWide(d.nameUtf8));
     if (!BtSvcThreadActive()) {
         if (!BtSvcStart(nullptr, StatusCb, DeviceCb, g_hwnd)) {
             g_detailUtf8 = "启动失败。";
@@ -292,22 +327,9 @@ static void PairDev(const DevRec& d)
 
 static void ForgetDev(const DevRec& d)
 {
-    BtSvcDisconnect();
-    BtSvcForgetDevice(d.addrUtf8.c_str());
+    BtSvcDisconnectAddr(d.addrUtf8.c_str());   // 只断这台，另一路不受影响
+    BtSvcForgetDevice(d.addrUtf8.c_str());   // 密钥+名字同删（单文件）
     g_devs.erase(d.addr);
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, AppFileW(L"paired_names.txt").c_str(), L"r, ccs=UTF-8") == 0 && f) {
-        std::vector<std::wstring> lines;
-        wchar_t line[256];
-        while (fgetws(line, 256, f))
-            if (wcsncmp(line, d.addr.c_str(), d.addr.size()) != 0 || line[d.addr.size()] != L'\t')
-                lines.push_back(line);
-        fclose(f);
-        if (_wfopen_s(&f, AppFileW(L"paired_names.txt").c_str(), L"w, ccs=UTF-8") == 0 && f) {
-            for (auto& l : lines) fputws(l.c_str(), f);
-            fclose(f);
-        }
-    }
 }
 
 static void ScanToggle()
@@ -351,22 +373,54 @@ static void CopyToggle()
 // 每 500ms：刷新设备状态文本
 static void UpdateDeviceStatuses()
 {
+    // 待补名字：配对一完成（IsPaired 变真）立即写入密钥行
+    for (auto it = g_pendingNames.begin(); it != g_pendingNames.end(); ) {
+        if (BtSvcIsPaired(it->first.c_str())) {
+            BtSvcSetName(it->first.c_str(), it->second.c_str());
+            it = g_pendingNames.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     const char* cur = BtSvcCurrentAddr();
-    int phase = BtSvcThreadActive() ? BtSvcPhase() : -1;
     for (auto& kv : g_devs) {
         DevRec& d = kv.second;
         const char* st = "未配对";
         bool streaming = false;
-        if (cur[0] && _stricmp(d.addrUtf8.c_str(), cur) == 0) {
-            if (phase == 3)      { st = "推流中"; streaming = true; }
-            else if (phase == 2) st = "连接中";
-            else                 st = "已连接";
+        // 双路：每台设备独立状态（不再由全局 phase 推导）
+        if (BtSvcIsStreamingAddr(d.addrUtf8.c_str())) {
+            st = "推流中"; streaming = true;
+        } else if (BtSvcIsConnectingAddr(d.addrUtf8.c_str())) {
+            st = "连接中";
         } else if (BtSvcIsPaired(d.addrUtf8.c_str())) {
             st = "已配对";
         }
         d.statusUtf8 = st;
         d.statusStreaming = streaming;
     }
+
+    // 名字同步补全：列表里认识的名字 → 同步进密钥库（含引擎自动配对的设备，
+    // 500ms 内必补上）。SetName 幂等：名字没变不写盘。
+    for (auto& kv : g_devs) {
+        DevRec& d = kv.second;
+        if (d.nameUtf8.empty() || d.nameUtf8 == "(已配对设备)") continue;
+        if (BtSvcIsPaired(d.addrUtf8.c_str()))
+            BtSvcSetName(d.addrUtf8.c_str(), d.nameUtf8.c_str());
+    }
+
+    // 有设备进入推流 → 自动开始复制系统默认输出（用户手动停过后不打扰，
+    // 到下一次推流开始时再自动开）
+    bool anyStreaming = false;
+    for (auto& kv : g_devs)
+        if (kv.second.statusStreaming) { anyStreaming = true; break; }
+    static bool prevAnyStreaming = false;
+    if (anyStreaming && !prevAnyStreaming && !LoopCaptureRunning()) {
+        std::wstring err;
+        if (LoopCaptureStart(CurrentSrcId(), err))
+            g_detailUtf8 = "推流已开始：自动复制系统声音。";
+    }
+    prevAnyStreaming = anyStreaming;
 }
 
 // ------------------------------------------------------------ D3D11
@@ -466,6 +520,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         HeapFree(GetProcessHeap(), 0, p);
 
         if (g_devs.find(d.addr) == g_devs.end()) g_devs[d.addr] = d;
+        // 已配对设备扫到真名 → 第一时间写进密钥库（名字与密钥同存一行），
+        // 避免磁盘上的名字被内存里无名字的旧条目落盘时覆盖
+        if (!d.nameUtf8.empty() && BtSvcIsPaired(d.addrUtf8.c_str()))
+        BtSvcSetName(d.addrUtf8.c_str(), d.nameUtf8.c_str());
         return 0;
     }
     }
@@ -521,10 +579,24 @@ static void DrawUI()
         if ((int)g_adapters.size() != lastCount) {
             items.clear();
             for (auto& a : g_adapters) {
+                // 两根同型号 dongle 的 VID/PID 和名字都相同，用实例 ID 尾号区分，
+                // 并标注当前归谁（本软件 WinUSB / 系统蓝牙 BTHUSB）
+                std::string tail;
+                {
+                    std::wstring iid = a.instanceId;
+                    size_t p = iid.find_last_of(L'&');
+                    tail = WideToUtf8(p != std::wstring::npos ? iid.substr(p) : iid);
+                }
                 char line[256];
-                sprintf_s(line, "%s  (%04X:%04X)  —  %s",
+                // 归属标签：本软件 / 系统蓝牙 / 驱动异常(问题码)
+                char tag[48];
+                if (a.winusb)               strcpy_s(tag, "本软件");
+                else if (a.problemCode)     sprintf_s(tag, "驱动异常%u", a.problemCode);
+                else                        strcpy_s(tag, "系统蓝牙");
+                sprintf_s(line, "%s  [%s]  (%04X:%04X%s)",
                           a.name.empty() ? "蓝牙适配器" : WideToUtf8(a.name).c_str(),
-                          a.vid, a.pid, a.winusb ? "可用" : "被系统占用");
+                          tag,
+                          a.vid, a.pid, tail.c_str());
                 items.push_back(line);
             }
             lastCount = (int)g_adapters.size();
@@ -594,54 +666,43 @@ static void DrawUI()
         if (ImGui::Button("切换驱动", ImVec2(100, 0))) {
             if (g_adapterSel >= 0 && g_adapterSel < (int)g_adapters.size()) {
                 BtAdapter& a = g_adapters[g_adapterSel];
-                std::wstring infPath;
-                if (AdapterWriteInf(a.vid, a.pid, infPath)) {
-                    std::wstring dir = infPath.substr(0, infPath.find_last_of(L'\\'));
-                    BtSvcStop();
-                    std::wstring ps1 = dir + L"\\switch.ps1";
-                    std::wstring log = dir + L"\\switch_log.txt";
-                    std::wstring pfx = AppFileW(L"winusb_cert.pfx");
-                    FILE* f = nullptr;
-                    if (_wfopen_s(&f, ps1.c_str(), L"w, ccs=UTF-8") == 0 && f) {
-                        fwprintf(f, L"$ErrorActionPreference='Continue'\n");
-                        fwprintf(f, L"Start-Transcript -Path '%s' -Force\n", log.c_str());
-                        fwprintf(f, L"$dir='%s'\n", dir.c_str());
-                        fwprintf(f, L"$pfx='%s'\n", pfx.c_str());
-                        fwprintf(f, L"$pwd2=ConvertTo-SecureString 'DualBlt123' -AsPlainText -Force\n");
-                        fwprintf(f, L"if (-not (Get-ChildItem Cert:\\LocalMachine\\My | Where-Object {$_.Subject -eq 'CN=DualBlt Test Signing'})) {\n");
-                        fwprintf(f, L"  [void](Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\\LocalMachine\\My -Password $pwd2)\n");
-                        fwprintf(f, L"}\n");
-                        fwprintf(f, L"$cat=Join-Path $dir 'DualBltWinUSB.cat'\n");
-                        fwprintf(f, L"Remove-Item $cat -Force -ErrorAction SilentlyContinue\n");
-                        fwprintf(f, L"New-FileCatalog -Path $dir -CatalogFilePath $cat | Out-Null\n");
-                        fwprintf(f, L"$st = Get-ChildItem 'C:\\Program Files (x86)\\Windows Kits\\10\\bin' -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Where-Object {$_.FullName -match '\\\\x64\\\\'} | Sort-Object FullName -Descending | Select-Object -First 1\n");
-                        fwprintf(f, L"if ($st) { & $st.FullName sign /f $pfx /p 'DualBlt123' /fd SHA256 $cat } else { Write-Output 'signtool missing' }\n");
-                        fwprintf(f, L"$inf = Join-Path $dir 'DualBltWinUSB.inf'\n");
-                        fwprintf(f, L"pnputil /add-driver $inf /install\n");
-                        fwprintf(f, L"pnputil /remove-device '%s'\n", a.instanceId.c_str());
-                        fwprintf(f, L"pnputil /scan-devices\n");
-                        fwprintf(f, L"Stop-Transcript\n");
-                        fclose(f);
-                        wchar_t params[512];
-                        swprintf_s(params, 512, L"-NoProfile -ExecutionPolicy Bypass -File \"%s\"", ps1.c_str());
-                        SHELLEXECUTEINFOW sx = {};
-                        sx.cbSize = sizeof(sx);
-                        sx.lpFile = L"powershell.exe";
-                        sx.lpParameters = params;
-                        sx.lpVerb = L"runas";
-                        sx.nShow = SW_HIDE;
-                        sx.fMask = SEE_MASK_NOCLOSEPROCESS;
-                        if (ShellExecuteExW(&sx) && sx.hProcess) {
-                            WaitForSingleObject(sx.hProcess, 120000);
-                            CloseHandle(sx.hProcess);
-                        }
-                        unsigned cv = 0, cp = 0;
-                        BtSvcGetUsbDevice(cv, cp);
-                        g_adapters = AdapterEnumAll((uint16_t)cv, (uint16_t)cp);
-                        g_detailUtf8 = "驱动切换完成，确认适配器状态后重新连接设备。";
-                    }
+                BtSvcStop();
+                std::wstring err;
+                // 按节点精准切换：DiInstallDevice 只动选中实例，另一根不受影响
+                if (AdapterSwitchDriver(a.instanceId, a.vid, a.pid, true, err)) {
+                    Sleep(2500);   // 等 Windows 重新绑定完成再刷新
+                    unsigned cv = 0, cp = 0;
+                    BtSvcGetUsbDevice(cv, cp);
+                    g_adapters = AdapterEnumAll((uint16_t)cv, (uint16_t)cp);
+                    g_detailUtf8 = "驱动切换完成，确认适配器状态后重新连接设备。";
                 } else {
-                    g_detailUtf8 = "生成 INF 失败（缺 DualBltWinUSB.inf 模板）。";
+                    g_detailUtf8 = WideToUtf8(err);
+                }
+            }
+        }
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    {
+        // 反向切换：选中的适配器当前是 WinUSB（归我们软件）→ 切回系统蓝牙
+        bool revertible = g_adapterSel >= 0 && g_adapterSel < (int)g_adapters.size()
+                          && g_adapters[g_adapterSel].winusb;
+        ImGui::BeginDisabled(!revertible);
+        if (ImGui::Button("切回系统蓝牙", ImVec2(120, 0))) {
+            if (g_adapterSel >= 0 && g_adapterSel < (int)g_adapters.size()) {
+                BtAdapter& a = g_adapters[g_adapterSel];
+                BtSvcStop();
+                std::wstring err;
+                // 按节点切回：DiInstallDevice 用收件箱 bthusb.inf 只装选中实例，
+                // 驱动包保持在库中不动，另一根 WinUSB dongle 不受影响
+                if (AdapterSwitchDriver(a.instanceId, a.vid, a.pid, false, err)) {
+                    Sleep(2500);   // 等 Windows 重新绑定完成再刷新
+                    unsigned cv = 0, cp = 0;
+                    BtSvcGetUsbDevice(cv, cp);
+                    g_adapters = AdapterEnumAll((uint16_t)cv, (uint16_t)cp);
+                    g_detailUtf8 = "已切回系统蓝牙。要点「切换驱动」才能再用本软件。";
+                } else {
+                    g_detailUtf8 = WideToUtf8(err);
                 }
             }
         }
@@ -671,6 +732,7 @@ static void DrawUI()
     }
     ImGui::SameLine();
     {
+        // 播放/暂停图标按钮（U+F04B play / U+F04C pause）
         bool capOn = LoopCaptureRunning();
         if (!capOn) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.816f, 1.000f, 0.000f, 1.0f));
@@ -678,8 +740,13 @@ static void DrawUI()
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.700f, 0.878f, 0.000f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.027f, 0.031f, 0.031f, 1.0f));
         }
-        if (ImGui::Button(capOn ? "停止复制声音" : "开始复制声音", ImVec2(146, 0))) CopyToggle();
+        if (g_fontIcon) ImGui::PushFont(g_fontIcon);
+        ImGui::SetNextItemWidth(46.0f);
+        if (ImGui::Button(capOn ? "\xEF\x80\x8C" : "\xEF\x80\x8B", ImVec2(46, 0))) CopyToggle();
+        if (g_fontIcon) ImGui::PopFont();
         if (!capOn) ImGui::PopStyleColor(4);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", capOn ? "暂停复制系统声音" : "复制系统声音到蓝牙");
     }
 
     // 推流音量行
@@ -740,8 +807,8 @@ static void DrawUI()
             if (ImGui::Selectable("##row", false,
                                   ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick))
             {
-                // 整行可点：推流中的行点击任意位置 = 断开；未连接的行 = 连接
-                if (rowStreaming) BtSvcDisconnect();
+                // 整行可点：推流中的行点击任意位置 = 断开（只断这台）；未连接的行 = 连接
+                if (rowStreaming) BtSvcDisconnectAddr(d.addrUtf8.c_str());
                 else              ConnectDev(d);
             }
             ImGui::PopStyleColor(3);
@@ -754,12 +821,16 @@ static void DrawUI()
             if (ImGui::BeginPopupContextItem("devctx")) {
                 if (ImGui::MenuItem("连接并推流")) ConnectDev(d);
                 if (ImGui::MenuItem("配对"))       PairDev(d);
-                if (ImGui::MenuItem("测试音"))     BtSvcSetTestTone(!BtSvcTestTone());
+                {
+                    bool ton = BtSvcTestToneAddr(d.addrUtf8.c_str());
+                    if (ImGui::MenuItem(ton ? "关闭测试音" : "测试音"))
+                        BtSvcSetTestToneAddr(d.addrUtf8.c_str(), !ton);
+                }
                 ImGui::Separator();
                 bool isCur = BtSvcCurrentAddr()[0] &&
                              _stricmp(BtSvcCurrentAddr(), d.addrUtf8.c_str()) == 0;
-                ImGui::BeginDisabled(!(isCur && streaming));
-                if (ImGui::MenuItem("断开")) BtSvcDisconnect();
+                ImGui::BeginDisabled(!streaming);
+                if (ImGui::MenuItem("断开")) BtSvcDisconnectAddr(d.addrUtf8.c_str());
                 ImGui::EndDisabled();
                 if (ImGui::MenuItem("忘记设备")) ForgetDev(d);
                 ImGui::EndPopup();
@@ -794,12 +865,10 @@ static void DrawUI()
             ImGui::TableNextColumn();
             if (yOff > 0) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + yOff);
             {
-                int ph2 = BtSvcThreadActive() ? BtSvcPhase() : -1;
-                bool isCur2 = BtSvcCurrentAddr()[0] &&
-                              _stricmp(BtSvcCurrentAddr(), d.addrUtf8.c_str()) == 0;
-                bool connecting = isCur2 && ph2 == 2;
-                bool streaming  = isCur2 && ph2 == 3;
-                bool failed     = isCur2 && ph2 == 4;
+                // 双路：按地址独立状态（不再由全局 phase 推导）
+                bool connecting = BtSvcIsConnectingAddr(d.addrUtf8.c_str());
+                bool streaming  = BtSvcIsStreamingAddr(d.addrUtf8.c_str());
+                bool failed     = false;
                 float t = (float)ImGui::GetTime();
                 ImVec2 tp = ImGui::GetCursorScreenPos();
                 float lh = ImGui::GetTextLineHeight();
@@ -820,7 +889,7 @@ static void DrawUI()
                     ImU32 ic = ImGui::GetColorU32(ImVec4(1.000f, 0.290f, 0.333f, 1.0f));
                     dl->AddLine(ImVec2(sc2.x - 5, sc2.y - 5), ImVec2(sc2.x + 5, sc2.y + 5), ic, 2.0f);
                     dl->AddLine(ImVec2(sc2.x - 5, sc2.y + 5), ImVec2(sc2.x + 5, sc2.y - 5), ic, 2.0f);
-                } else if (isCur2) {
+                } else if (BtSvcIsPaired(d.addrUtf8.c_str())) {
                     dl->AddCircle(sc2, 4.5f, ImGui::GetColorU32(ImVec4(0.169f, 0.760f, 0.208f, 1.0f)), 16, 2.0f);
                 } else {
                     ImU32 ic = ImGui::GetColorU32(ImVec4(0.627f, 0.639f, 0.655f, 0.7f));
@@ -834,11 +903,9 @@ static void DrawUI()
             //   连接中     = 灰底禁用
             ImGui::TableNextColumn();
             {
-                int ph2 = BtSvcThreadActive() ? BtSvcPhase() : -1;
-                bool isCur2 = BtSvcCurrentAddr()[0] &&
-                              _stricmp(BtSvcCurrentAddr(), d.addrUtf8.c_str()) == 0;
-                bool connecting = isCur2 && ph2 == 2;
-                bool streaming  = isCur2 && ph2 == 3;
+                // 双路：按地址独立状态
+                bool connecting = BtSvcIsConnectingAddr(d.addrUtf8.c_str());
+                bool streaming  = BtSvcIsStreamingAddr(d.addrUtf8.c_str());
                 float pad2 = ImGui::GetStyle().CellPadding.y;
                 ImVec2 cpos = ImGui::GetCursorScreenPos();
                 float cx1 = cpos.x - ImGui::GetStyle().CellPadding.x;
@@ -870,12 +937,15 @@ static void DrawUI()
                 }
                 char bid[40];
                 sprintf_s(bid, "##act%s", d.addrUtf8.c_str());
+                ImGui::SetCursorScreenPos(bmin);
+                ImVec2 actSz(bmax.x - bmin.x, bmax.y - bmin.y);
                 if (!connecting) {
-                    ImGui::SetCursorScreenPos(bmin);
-                    if (ImGui::InvisibleButton(bid, ImVec2(bmax.x - bmin.x, bmax.y - bmin.y))) {
-                        if (streaming) BtSvcDisconnect();   // 断开
+                    if (ImGui::InvisibleButton(bid, actSz)) {
+                        if (streaming) BtSvcDisconnectAddr(d.addrUtf8.c_str());   // 只断这台
                         else           ConnectDev(d);       // 连接/重试
                     }
+                } else {
+                    ImGui::Dummy(actSz);   // 连接中：占位保持行高一致（否则行高塌陷）
                 }
             }
             ImGui::PopID();
@@ -887,6 +957,24 @@ static void DrawUI()
     ImGui::EndChild();
 
     ImGui::Separator();
+
+    // 适配器挂死横幅：控制器无响应，必须拔插 dongle（拔插后自动恢复）
+    if (BtSvcThreadActive() && BtSvcAdapterDead()) {
+        float t = (float)ImGui::GetTime();
+        float pulse = 0.6f + 0.4f * sinf(t * 4.0f);
+        ImVec4 bc(1.000f * pulse, 0.150f * pulse, 0.200f * pulse, 1.0f);
+        ImGui::PushFont(g_fontSmall ? g_fontSmall : ImGui::GetFont());
+        ImVec2 ts = ImGui::CalcTextSize("适配器无响应：请拔插 dongle（拔插后自动恢复）");
+        ImVec2 cs = ImGui::GetCursorScreenPos();
+        ImDrawList* dl2 = ImGui::GetWindowDrawList();
+        dl2->AddRectFilled(cs, ImVec2(cs.x + ts.x + 16, cs.y + ts.y + 8),
+                           ImGui::GetColorU32(ImVec4(0.30f, 0.05f, 0.07f, 1.0f)), 4.0f);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 8);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
+        ImGui::TextColored(bc, "适配器无响应：请拔插 dongle（拔插后自动恢复）");
+        ImGui::PopFont();
+        ImGui::Dummy(ImVec2(0, 4));
+    }
 
     // 状态条：一行小字（状态 + 说明合并；flap 语义色）
     ImVec4 sc(0.627f, 0.639f, 0.655f, 1.0f);
@@ -1074,6 +1162,7 @@ void ShowBtA2dpPanel(HWND parent)
                 0xf026, 0xf026,   // (volume)
                 0xf027, 0xf027,   // volume-low
                 0xf028, 0xf028,   // volume-high
+                0xf04b, 0xf04c,   // play / pause
                 0xf1e6, 0xf1e6,   // plug
                 0xf287, 0xf287,   // usb
                 0xf6a9, 0xf6a9,   // volume-xmark

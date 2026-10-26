@@ -1,20 +1,21 @@
 @echo off
 setlocal
-set VCVARS=G:\VS2022BuildTools\VC\Auxiliary\Build\vcvars64.bat
+set VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat
+if not exist "%VCVARS%" set VCVARS=G:\VS2022BuildTools\VC\Auxiliary\Build\vcvars64.bat
 if not exist "%VCVARS%" goto :novc
 call "%VCVARS%"
 if errorlevel 1 goto :vcfail
 if not exist build mkdir build
 if not exist build\bt mkdir build\bt
-copy /y "g:\multi_blt\winusb\pkg\DualBltWinUSB.inf" build\ >nul 2>&1
-copy /y "g:\multi_blt\winusb\cert.pfx" build\winusb_cert.pfx >nul 2>&1
-copy /y "g:\multi_blt\assets\DualBlt.ico" build\ >nul 2>&1
-copy /y "g:\multi_blt\assets\fa-solid-900.ttf" build\ >nul 2>&1
-copy /y "g:\multi_blt\assets\ui.html" build\ >nul 2>&1
-copy /y "g:\multi_blt\webview2\x64\WebView2Loader.dll" build\ >nul 2>&1
+copy /y "d:\dual blt\winusb\pkg\DualBltWinUSB.inf" build\ >nul 2>&1
+copy /y "d:\dual blt\winusb\cert.pfx" build\winusb_cert.pfx >nul 2>&1
+copy /y "d:\dual blt\assets\DualBlt.ico" build\ >nul 2>&1
+copy /y "d:\dual blt\assets\fa-solid-900.ttf" build\ >nul 2>&1
+copy /y "d:\dual blt\assets\ui.html" build\ >nul 2>&1
+copy /y "d:\dual blt\webview2\x64\WebView2Loader.dll" build\ >nul 2>&1
 
-set BTSTACK=g:\multi_blt\third_party\btstack
-set PORT=g:\multi_blt\btstack_port
+set BTSTACK=d:\dual blt\third_party\btstack
+set PORT=d:\dual blt\btstack_port
 set CFLAGS=/nologo /O2 /EHsc /std:c++17 /utf-8 /W3 /wd4819 /DNOMINMAX /D_UNICODE /DUNICODE
 
 echo --- GUI ---
@@ -57,16 +58,17 @@ if errorlevel 1 goto :fail
 echo --- GUI ---
 rem 注：src\btpanel3.cpp 为 WebView2 备用面板（未参与编译）。如需启用：
 rem   1) 在下行 sources 中加入 src\btpanel3.cpp
-rem   2) include 路径加 /I"g:\multi_blt\webview2\include"
-rem   3) link 加 advapi32.lib "g:\multi_blt\webview2\x64\WebView2LoaderStatic.lib"
+rem   2) include 路径加 /I"d:\dual blt\webview2\include"
+rem   3) link 加 advapi32.lib "d:\dual blt\webview2\x64\WebView2LoaderStatic.lib"
 rem   4) gui.cpp 调用 ShowBtA2dpPanelWV(nullptr)
-cl %CFLAGS% /Fo:build\ /Fe:build\DualBlt.exe src\engine.cpp src\gui.cpp src\btpanel.cpp src\btcore.cpp src\btsvc.cpp src\btpanel2.cpp src\loopcap.cpp src\adapter.cpp ^
+rc /nologo /fo build\gui.res src\gui.rc
+cl %CFLAGS% /Fo:build\ /Fe:build\DualBlt.exe src\engine.cpp src\gui.cpp src\btpanel.cpp src\btcore.cpp src\btsvc.cpp src\btpanel2.cpp src\loopcap.cpp src\adapter.cpp build\gui.res ^
   "%BTSTACK%\..\imgui\imgui.cpp" "%BTSTACK%\..\imgui\imgui_draw.cpp" "%BTSTACK%\..\imgui\imgui_tables.cpp" "%BTSTACK%\..\imgui\imgui_widgets.cpp" ^
   "%BTSTACK%\..\imgui\backends\imgui_impl_win32.cpp" "%BTSTACK%\..\imgui\backends\imgui_impl_dx11.cpp" ^
   /I"%PORT%" /I"%BTSTACK%\src" /I"%BTSTACK%\src\classic" /I"%BTSTACK%\platform\windows" ^
   /I"%BTSTACK%\3rd-party\bluedroid\encoder\include" /I"%BTSTACK%\3rd-party\bluedroid\decoder\include" ^
   /I"%BTSTACK%\..\imgui" /I"%BTSTACK%\..\imgui\backends" ^
-  /link /SUBSYSTEM:WINDOWS build\bt\*.obj winusb.lib setupapi.lib ws2_32.lib d3d11.lib dxgi.lib
+  /link /SUBSYSTEM:WINDOWS build\bt\*.obj winusb.lib setupapi.lib ws2_32.lib d3d11.lib dxgi.lib newdev.lib
 if errorlevel 1 goto :fail
 
 echo --- CLI ---

@@ -5,6 +5,7 @@
 #include "engine.h"
 #include "btpanel.h"
 #include "btpanel2.h"
+#include "btsvc.h"
 
 #include <windows.h>
 #include <commctrl.h>
@@ -516,6 +517,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         OnStop();
+        // 停 BTstack 服务（内含优雅断开：先断流/ACL 再退出，
+        // 否则进程硬杀会让耳机异常掉线并疯狂重连，重开后 0x08 撞车）
+        BtSvcStop();
         if (g_enum && g_notify.hwnd) g_enum->UnregisterEndpointNotificationCallback(&g_notify);
         if (g_enum) { g_enum->Release(); g_enum = nullptr; }
         PostQuitMessage(0);
