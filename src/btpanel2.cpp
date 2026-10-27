@@ -75,7 +75,7 @@ static int g_adapterSel = -1;
 static std::string g_statusUtf8 = "【待机】点「扫描」查找设备";
 static std::string g_detailUtf8;
 
-static float g_volUi = 100.0f;
+static float g_volUi = 0.0f;      // 推流增益（dB，0 = 原始音量，范围 -30..+6）
 static bool  g_volMute = false;
 static DWORD g_lastVolumeEdit = 0;                   // 滑条编辑时间（同步轮询避让）
 static DWORD g_lastUiTick = 0;
@@ -262,35 +262,20 @@ static bool EndpointVolSet(const std::wstring& id, float vol, bool muted)
     return true;
 }
 
+static void VolumeApplyUI();   // 前置声明（VolumeLoadUI 先用到）
+
 static void VolumeLoadUI()
 {
-    float v = 0; bool m = false;
-    if (EndpointVolGet(CurrentSrcId(), v, m)) {
-        g_volUi = v * 100.0f;
-        g_volMute = m;
-    }
-    // 增益与 UI 同步，避免“滑条显示 30% 实际还是 100%”的初始失配
-    BtSvcSetGain(g_volMute ? 0.0f : g_volUi / 100.0f);
+    // 增益与 UI 同步（dB → 线性增益；0 dB = 1.0x = 原始音量）
+    VolumeApplyUI();
 }
 
 static void VolumeApplyUI()
 {
-    // 关键：滑条必须走软件增益（编码前缩放 PCM）才对推流有效。
-    // Windows 端点主音量在回环采集点之后，调它不影响推出去的音频；测试音则完全绕过采集。
-    BtSvcSetGain(g_volMute ? 0.0f : g_volUi / 100.0f);
-    EndpointVolSet(CurrentSrcId(), g_volUi / 100.0f, g_volMute);
-    g_lastVolumeEdit = GetTickCount();
-}
-
-static void VolumeSyncFromSystem()
-{
-    if (GetTickCount() - g_lastVolumeEdit < 700) return;   // 刚编辑过，避让
-    float v = 0; bool m = false;
-    if (!EndpointVolGet(CurrentSrcId(), v, m)) return;
-    g_volUi = v * 100.0f;
-    g_volMute = m;
-    // 系统音量变化（如键盘音量键）同步到推流增益，保持滑条与实际推流音量一致
-    BtSvcSetGain(g_volMute ? 0.0f : g_volUi / 100.0f);
+    // 纯软件增益：编码前缩放 PCM，只作用于推流，不碰系统音量。
+    // 滑条以 dB 表示，0（中点）= 原始数据不增不减；负值衰减、正值放大。
+    float gain = g_volMute ? 0.0f : powf(10.0f, g_volUi / 20.0f);
+    BtSvcSetGain(gain);
 }
 
 // ------------------------------------------------------------ 设备操作
@@ -362,6 +347,7 @@ static void CopyToggle()
         BtSvcSetTestTone(false);
         std::wstring err;
         if (LoopCaptureStart(CurrentSrcId(), err)) {
+            BtSvcJumpToLive();   // 清空连接/等待期间攒下的陈旧音频，从实时边开始
             g_detailUtf8 = "正在复制系统声音到蓝牙（在电脑上播放音乐即可听到）。";
         } else {
             g_detailUtf8 = WideToUtf8(L"复制失败：" + err);
@@ -492,6 +478,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         if ((wp & 0xfff0) == SC_KEYMENU) return 0;
         break;
     case WM_DESTROY:
+        // 优雅关闭：停回环采集 + 等 BTstack 断开全部连接并释放完毕（阻塞至多 ~3s），
+        // 之前的硬杀会让耳机异常掉线并疯狂重连
+        LoopCaptureStop();
+        BtSvcStop();
         PostQuitMessage(0);
         return 0;
     case WM_A2_STATUS: {
@@ -773,15 +763,72 @@ static void DrawUI()
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", capOn ? "暂停复制系统声音" : "复制系统声音到蓝牙");
     }
+    ImGui::SameLine();
+    {
+        // 采集信号指示器（防抖 VU）：整块垂直居中对齐左侧按钮，从下往上点亮
+        // 复制中 → 显示采集电平；近 1.5s 有信号=绿色，静音超时=红色（提示音源问题）
+        bool capOn2 = LoopCaptureRunning();
+        float vu = BtSvcCaptureLevel();      // 服务侧已平滑（快起慢落）
+        bool alive = capOn2 && BtSvcCaptureAlive();
+        ImVec2 c = ImGui::GetCursorScreenPos();
+        float bh = ImGui::GetFrameHeight();
+        ImDrawList* dl3 = ImGui::GetWindowDrawList();
+        ImVec4 colBg(0.26f, 0.28f, 0.31f, 1.0f);
+        ImVec4 colFg = alive ? ImVec4(0.169f, 0.760f, 0.208f, 1.0f)
+                             : ImVec4(1.000f, 0.290f, 0.333f, 1.0f);
+        // 4 段竖条：整体在行高内垂直居中；i=0 为最底段（门槛最低，先亮）
+        const int   n    = 4;
+        const float segH = bh * 0.12f;
+        const float gap  = bh * 0.10f;
+        const float totalH = n * segH + (n - 1) * gap;
+        float top = c.y + (bh - totalH) * 0.5f;
+        for (int i = 0; i < n; ++i) {
+            float y = top + totalH - segH - i * (segH + gap);   // 从下往上
+            dl3->AddRectFilled(ImVec2(c.x + 5, y), ImVec2(c.x + 19, y + segH),
+                               ImGui::GetColorU32(colBg), 1.0f);
+            if (vu >= 0.08f * (i + 1) || (i == 0 && vu > 0.01f))
+                dl3->AddRectFilled(ImVec2(c.x + 5, y), ImVec2(c.x + 19, y + segH),
+                                   ImGui::GetColorU32(colFg), 1.0f);
+        }
+        ImGui::Dummy(ImVec2(24, bh));
+        if (ImGui::IsItemHovered()) {
+            if (!capOn2)
+                ImGui::SetTooltip("未在复制系统声音");
+            else if (alive)
+                ImGui::SetTooltip("采集正常（电平 %d%%）", (int)(vu * 100 + 0.5f));
+            else
+                ImGui::SetTooltip("复制中但采集到静音——检查音源选择/是否正在播放");
+        }
+    }
 
     // 推流音量行
     DrawRowIcon(2);
     ImGui::SameLine(44.0f);
     ImGui::SetNextItemWidth(300);
-    bool edited = ImGui::SliderFloat("##vol", &g_volUi, 0.0f, 100.0f, "%.0f%%");
+    bool edited = ImGui::SliderFloat("##vol", &g_volUi, -30.0f, 30.0f, "%+.1f dB");
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+        g_volUi = 0.0f;            // 双击回到 0 dB（原始音量）
+        VolumeApplyUI();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("推流增益（0 = 原始音量，双击复位）");
     ImGui::SameLine();
     if (ImGui::Checkbox("静音", &g_volMute)) VolumeApplyUI();
     if (edited) VolumeApplyUI();
+    ImGui::SameLine();
+    {
+        // SBC 码率选择：双路推流建议切低码率（两路合计带宽更容易超出
+        // 单 dongle 射频上限 → 偶发单边断音/交替）。重连后生效。
+        static int bpSel = 1;   // 0=低(28) 1=中(40) 2=高(53)
+        const char* bpNames[] = { "低", "中", "高" };
+        ImGui::SetNextItemWidth(52);
+        if (ImGui::Combo("码率", &bpSel, bpNames, 3)) {
+            BtSvcSetBitpoolCap(bpSel == 0 ? 28 : bpSel == 1 ? 40 : 53);
+            g_detailUtf8 = "码率已切换，重连设备后生效";
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("双路推流建议「低」（省射频带宽，抗断音）");
+    }
     ImGui::PopStyleVar(2);
     ImGui::PopFont();
 
@@ -797,10 +844,11 @@ static void DrawUI()
     // 否则表格右侧会预留滚动条宽度，导致自绘行高亮比列区宽出一截
     ImGui::BeginChild("##devlist", ImVec2(0, listH), ImGuiChildFlags_None);
     // 设备列表：类型图标 | 名称 | 状态
-    if (ImGui::BeginTable("dev", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+    if (ImGui::BeginTable("dev", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("##icon", ImGuiTableColumnFlags_WidthFixed, 34);
         ImGui::TableSetupColumn("名称", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("状态", ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn("耳机音量", ImGuiTableColumnFlags_WidthFixed, 120);
         ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, 56);
         ImDrawList* dl = ImGui::GetWindowDrawList();
         for (auto& kv : g_devs) {
@@ -826,8 +874,12 @@ static void DrawUI()
             ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
             // 双路：按设备地址独立判断（BtSvcCurrentAddr 只返回第一条活动流，双流时必错）
             bool rowStreaming = BtSvcIsStreamingAddr(d.addrUtf8.c_str());
+            // AllowOverlap：行内后提交的控件（音量滑条、操作按钮）优先接收
+            // 交互——没有这个标志 Selectable 会抢走整行的点击/拖动
             if (ImGui::Selectable("##row", false,
-                                  ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick))
+                                  ImGuiSelectableFlags_SpanAllColumns
+                                  | ImGuiSelectableFlags_AllowDoubleClick
+                                  | ImGuiSelectableFlags_AllowOverlap))
             {
                 // 整行可点：推流中的行点击任意位置 = 断开（只断这台）；未连接的行 = 连接
                 if (rowStreaming) BtSvcDisconnectAddr(d.addrUtf8.c_str());
@@ -900,11 +952,24 @@ static void DrawUI()
                     dl->PathArcTo(sc2, 6.0f, a0, a0 + 4.2f, 20);
                     dl->PathStroke(ic, 0, 2.0f);
                 } else if (streaming) {
-                    ImU32 ic = ImGui::GetColorU32(ImVec4(0.169f, 0.760f, 0.208f, 1.0f));
-                    for (int k = 0; k < 3; ++k) {
-                        float hgt = 3.0f + 5.0f * (0.5f + 0.5f * sinf(t * 7.0f + k * 2.1f));
-                        float bx = sc2.x - 5.5f + k * 4.5f;
-                        dl->AddRectFilled(ImVec2(bx, sc2.y + 5.0f - hgt), ImVec2(bx + 2.8f, sc2.y + 5.0f), ic, 1.0f);
+                    // 推流中：真实采集电平 VU（与主指示器同款，从下往上点亮）
+                    float lv = BtSvcCaptureLevel();
+                    bool alive = BtSvcCaptureAlive();
+                    ImU32 colBg = ImGui::GetColorU32(ImVec4(0.26f, 0.28f, 0.31f, 1.0f));
+                    ImU32 colFg = ImGui::GetColorU32(alive
+                        ? ImVec4(0.169f, 0.760f, 0.208f, 1.0f)
+                        : ImVec4(1.000f, 0.290f, 0.333f, 1.0f));
+                    const int   n = 4;
+                    const float segH = 3.0f, gap = 1.5f, segW = 5.0f;
+                    const float totalH = n * segH + (n - 1) * gap;
+                    float top = sc2.y - totalH * 0.5f;
+                    for (int i = 0; i < n; ++i) {
+                        float y = top + totalH - segH - i * (segH + gap);   // 自下而上
+                        dl->AddRectFilled(ImVec2(sc2.x - segW * 0.5f, y),
+                                          ImVec2(sc2.x + segW * 0.5f, y + segH), colBg, 1.0f);
+                        if (lv >= 0.08f * (i + 1) || (i == 0 && lv > 0.01f))
+                            dl->AddRectFilled(ImVec2(sc2.x - segW * 0.5f, y),
+                                             ImVec2(sc2.x + segW * 0.5f, y + segH), colFg, 1.0f);
                     }
                 } else if (failed) {
                     ImU32 ic = ImGui::GetColorU32(ImVec4(1.000f, 0.290f, 0.333f, 1.0f));
@@ -915,6 +980,79 @@ static void DrawUI()
                 } else {
                     ImU32 ic = ImGui::GetColorU32(ImVec4(0.627f, 0.639f, 0.655f, 0.7f));
                     dl->AddCircleFilled(sc2, 3.5f, ic, 12);
+                }
+            }
+
+            // 耳机音量列：实心填充条（0=全空，100=全实，无滑块）。
+            // 拖动=按横向位置直接定位；滚轮=±5%/格；拖动中防抖下发（200ms 一次），
+            // 松手终发。InvisibleButton 命中（同 ✕ 模式，行 AllowOverlap 放行）。
+            ImGui::TableNextColumn();
+            {
+                struct DragState { int val; DWORD sent; };
+                static std::map<std::string, DragState> dragHp;
+                bool dragging = dragHp.count(d.addrUtf8) != 0;
+                int cur = BtSvcGetHpVolume(d.addrUtf8.c_str());   // 0..127，-1 未知
+                if (cur < 0 && !dragging && !BtSvcIsStreamingAddr(d.addrUtf8.c_str())) {
+                    float yOff = (rowH - ImGui::GetTextLineHeight()) * 0.5f;
+                    if (yOff > 0) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + yOff);
+                    ImGui::TextDisabled("-");
+                } else {
+                    // 未知音量（-1）时以 50% 为滚轮/拖动基准——
+                    // 避免从 0 起算把耳机误设成极小音量
+                    int pct = dragging ? dragHp[d.addrUtf8].val
+                                       : (cur < 0 ? 50 : (cur * 100 + 63) / 127);
+                    const float bw = 86.0f, bh = 7.0f;
+                    // %→vol 用四舍五入映射：(p*127+50)/100。若用截断（p*127/100），
+                    // 部分 pct 往返会丢 1（77→97→读回 76），滚轮 +1 永远上不去
+                    auto PctToVol = [](int p) { return (p * 127 + 50) / 100; };
+                    float soff = (rowH - bh) * 0.5f;
+                    if (soff > 0) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + soff);
+                    ImVec2 p = ImGui::GetCursorScreenPos();
+                    ImGui::InvisibleButton("##hpvol", ImVec2(bw, bh));
+                    // 拖动：横向位置即音量
+                    if (ImGui::IsItemActive()) {
+                        float rel = (ImGui::GetIO().MousePos.x - p.x) / bw * 100.0f;
+                        if (rel < 0) rel = 0;
+                        if (rel > 100) rel = 100;
+                        pct = (int)(rel + 0.5f);
+                        auto& ds = dragHp[d.addrUtf8];
+                        ds.val = pct;
+                        DWORD now = GetTickCount();
+                        if (now - ds.sent >= 100) {          // 防抖：拖动中 100ms 一次
+                            ds.sent = now;
+                            BtSvcSetHpVolume(d.addrUtf8.c_str(), PctToVol(pct));
+                        }
+                    }
+                    if (dragging && ImGui::IsItemDeactivated()) {   // 松手：终发落定
+                        BtSvcSetHpVolume(d.addrUtf8.c_str(), PctToVol(pct));
+                        dragHp.erase(d.addrUtf8);
+                    }
+                    // 滚轮：悬停 ±1%/格（未知音量从 50% 起步）
+                    float wheel = ImGui::GetIO().MouseWheel;
+                    if (!dragging && ImGui::IsItemHovered() && wheel != 0.0f) {
+                        int base = (cur < 0 ? 50 : (cur * 100 + 63) / 127) + (int)wheel;
+                        if (base < 0) base = 0;
+                        if (base > 100) base = 100;
+                        BtSvcSetHpVolume(d.addrUtf8.c_str(), PctToVol(base));
+                        pct = base;
+                    }
+                    // 绘制：左边实心到值，右边空心。未知音量（-1）用灰色
+                    // 表示"耳机未上报真实值"，50% 只是交互基准不是实际值
+                    ImDrawList* dl2 = ImGui::GetWindowDrawList();
+                    dl2->AddRectFilled(p, ImVec2(p.x + bw, p.y + bh),
+                                       ImGui::GetColorU32(ImVec4(0.30f, 0.32f, 0.36f, 1.0f)), 3.0f);
+                    bool unknown = (cur < 0 && !dragging);
+                    ImU32 colF = unknown ? ImGui::GetColorU32(ImVec4(0.55f, 0.58f, 0.62f, 1.0f))
+                                         : ImGui::GetColorU32(ImVec4(0.816f, 1.000f, 0.000f, 1.0f));
+                    float fw = bw * pct / 100.0f;
+                    if (fw > 0.5f)
+                        dl2->AddRectFilled(p, ImVec2(p.x + fw, p.y + bh), colF, 3.0f);
+                    if (ImGui::IsItemHovered()) {
+                        if (unknown)
+                            ImGui::SetTooltip("音量未知（耳机未上报真实值）——拖动/滚轮将以 50%% 起步设置");
+                        else
+                            ImGui::SetTooltip("耳机音量 %d%%（拖动定位；滚轮 ±1%/格）", pct);
+                    }
                 }
             }
 
@@ -1206,12 +1344,11 @@ void ShowBtA2dpPanel(HWND parent)
         }
         if (done) break;
 
-        // 500ms 周期任务：设备状态刷新 + 系统音量同步
+        // 500ms 周期任务：设备状态刷新（音量不再同步系统——纯软件增益）
         DWORD now = GetTickCount();
         if (now - g_lastUiTick2 >= 500) {
             g_lastUiTick2 = now;
             UpdateDeviceStatuses();
-            VolumeSyncFromSystem();
             int ph = BtSvcThreadActive() ? BtSvcPhase() : -1;
             switch (ph) {
             case 1: g_statusUtf8 = "【扫描中】让设备进入配对模式"; break;

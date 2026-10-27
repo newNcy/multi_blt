@@ -12,6 +12,9 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#pragma comment(lib, "winmm.lib")   // timeBeginPeriod：1ms 定时器精度
+#include <thread>
+#include <vector>
 #include <map>
 #include <string>
 
@@ -74,6 +77,10 @@ static std::atomic<bool>      g_cmdPair{ false };
 static std::atomic<bool>      g_cmdDisconnect{ false };
 static char                   g_discAddr[32] = "";              // 按地址断开的目标
 static std::atomic<bool>      g_cmdDisconnectAddr{ false };     // 双路：只断该地址
+static char                   g_hpVolAddr[32] = "";             // 耳机音量设置目标
+static int                    g_hpVolVal = 0;                   // 音量值（0..127）
+static std::atomic<bool>      g_cmdHpVolume{ false };           // 设置耳机音量命令
+static std::atomic<bool>      g_cmdJumpLive{ false };           // 跳实时（清待发缓存）
 static std::atomic<DWORD>     g_disconnectTick{ 0 };   // 断开冷却：防止断开后立即误重连
 static char                   g_rejectAddr[32] = "";   // 用户刚断开的地址：拒绝其自动重连
 static std::atomic<DWORD>     g_rejectUntil{ 0 };
@@ -85,6 +92,7 @@ static char                   g_pendingAddr[8][32] = {};  // 串行化排队：�
 static int                    g_pendingCount = 0;
 static volatile bool          g_scanActive = false;
 static volatile bool          g_btUp = false;
+static volatile int           g_bpCap = 40;           // SBC 编码码率上限（用户可选；双路建议低码率）
 static int                    g_bootFails = 0;        // 连续启动失败计数（3 次提示拔插）
 static std::atomic<bool>      g_adapterDead{ false }; // 控制器挂死（UI 显示用）
 static std::atomic<bool>      g_runLoopUp{ false };   // run loop 是否存活（防跨线程误调用）
@@ -113,29 +121,53 @@ static std::wstring AppFileW(const wchar_t* name)
 // 周期性卡住（杀软扫描下一次几十毫秒）→ 推流一卡一卡。改为进程内只打开一次，
 // 之后每行写入 + fflush（崩溃前最后一行也能落盘），开销降两个数量级
 static std::mutex g_logMtx;
-static FILE*      g_logFile = nullptr;
+static FILE*      g_logFile = nullptr;                  // 日志线程私有句柄
+static std::vector<std::wstring> g_logQ;               // 待写盘队列
+static std::atomic<bool> g_logRun{ true };
+
+// 专职日志落盘线程：音频/UI 线程只入队（短临界区），磁盘 IO 全在这里
+static void LogDrainMain()
+{
+    while (g_logRun.load()) {
+        Sleep(200);
+        std::vector<std::wstring> batch;
+        {
+            std::lock_guard<std::mutex> lk(g_logMtx);
+            batch.swap(g_logQ);
+        }
+        if (batch.empty()) continue;
+        if (!g_logFile) {
+            // 显式共享读：否则外部（PowerShell/type）读不了正被写的日志
+            g_logFile = _wfsopen(AppFileW(L"btsvc.log").c_str(), L"a, ccs=UTF-8", _SH_DENYNO);
+        }
+        if (g_logFile) {
+            for (auto& l : batch) fwprintf(g_logFile, L"%s", l.c_str());
+            fflush(g_logFile);
+        }
+    }
+}
+static std::once_flag g_logOnce;
+static void LogStart() { std::call_once(g_logOnce, []{ std::thread(LogDrainMain).detach(); }); }
 
 static void Post(const wchar_t* fmt, ...)
 {
+    LogStart();   // 首次调用时拉起落盘线程
     wchar_t buf[256];
     va_list ap;
     va_start(ap, fmt);
     _vsnwprintf_s(buf, 256, _TRUNCATE, fmt, ap);
     va_end(ap);
 
-    // 写日志文件（诊断用，不会卡 UI）。文件行带时间戳，UI 不带
+    // 异步落盘：磁盘 IO 不在音频/UI 线程上发生（fwprintf+fflush 在音频线程
+    // 直接执行会造成编码停拍 = 周期性小卡）。入队后由专职日志线程写盘。
     {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        wchar_t line[300];
+        swprintf_s(line, L"[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buf);
         std::lock_guard<std::mutex> lk(g_logMtx);
-        if (!g_logFile) {
-            // 显式共享读：否则外部（PowerShell/type）读不了正被写的日志
-            g_logFile = _wfsopen(AppFileW(L"btsvc.log").c_str(), L"a, ccs=UTF-8", _SH_DENYNO);
-        }
-        if (g_logFile) {
-            SYSTEMTIME st;
-            GetLocalTime(&st);
-            fwprintf(g_logFile, L"[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buf);
-            fflush(g_logFile);
-        }
+        g_logQ.emplace_back(line);
+        if (g_logQ.size() > 2000) g_logQ.erase(g_logQ.begin());   // 防泄漏兜底
     }
 
     if (!g_cb) return;
@@ -168,11 +200,20 @@ typedef struct {
     uint32_t byteCount;
     uint32_t dropCount;              // 发送未完成（缓冲满等）次数，保留数据待重试
     volatile uint8_t testTone;       // 本路测试音开关（按设备隔离）
+    volatile int hpVolume;           // 本路耳机音量（AVRCP 上报，0..127，-1 未知）
+    volatile int hpSetPending;       // 在途音量设置笔数（应答按序回来，中间的丢弃）
+    volatile DWORD hpSetLastMs;      // 最近一笔设置下发时刻（通知回声窗判定）
+    volatile int avrcpDelayTicks;    // 推流启动后延迟连接 AVRCP 的倒计时（200ms 单位）
+    volatile int volProbeTicks;      // 连上 AVRCP 后等待真实音量上报的探测窗（200ms 单位）
     uint32_t openedMs;               // 媒体流打开时刻（打开后迟迟无 START → 看门狗接管）
     uint8_t  aclDropPending;         // 信令断开后待拆 ACL（先 A2DP 后 ACL 的顺序拆除）
 } sending_ctx_t;
 
 static sending_ctx_t            media[NUM_STREAMS];
+
+// 每设备记忆音量（定义见"耳机音量"段；此处前置供早期事件处理使用）
+static void VolRemember(const char* addr, int vol);
+static int  VolRemembered(const char* addr);
 static btstack_sbc_encoder_bluedroid_t sbc_encoder_state[NUM_STREAMS];
 static const btstack_sbc_encoder_t * sbc_encoder_instance[NUM_STREAMS];
 static btstack_packet_callback_registration_t hci_event_callback_registration;
@@ -210,6 +251,7 @@ static void ResetStream(int i)
     // UI 线程（BtSvcStart）里被调用，此时 run loop 可能尚未初始化（断言崩溃）。
     // 重启时 run loop 是全新的、无残留定时器，纯清零即可。
     memset(&media[i], 0, sizeof(sending_ctx_t));
+    media[i].hpVolume = -1;      // memset 会清成 0（会被误显示为 0%），未知应为 -1
     media[i].negRate = PREFERRED_SAMPLING_RATE;
     // memset 会把 acl_handle 清成 0，而 0 不是 INVALID（0xFFFF）——
     // 残留的 0 会让看门狗误以为 ACL 已建立，在寻呼阶段误杀建流
@@ -291,10 +333,11 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
         avrcp_target_support_event(acid, AVRCP_NOTIFICATION_EVENT_PLAYBACK_STATUS_CHANGED);
         avrcp_target_support_event(acid, AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
         avrcp_target_support_event(acid, AVRCP_NOTIFICATION_EVENT_NOW_PLAYING_CONTENT_CHANGED);
-        // 关键：主动设置耳机绝对音量（有些 TWS 没收到这个命令就静音）
-        avrcp_controller_set_absolute_volume(acid, 127);   // 100%
+        // 尊重耳机自身音量（不强制 100%）。订阅音量变化通知：
+        // 注册后耳机先发当前值（interim），之后每次用户调节实时上报
         avrcp_controller_enable_notification(acid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
-        Post(L"AVRCP: 控制通道已建立 cid=0x%04x，已下发绝对音量 127", acid);
+        media[i].volProbeTicks = 8;   // 1.6s 探测窗：等耳机 interim 上报真实音量
+        Post(L"AVRCP: 控制通道已建立 cid=0x%04x，等待耳机上报音量…", acid);
         break;
     }
     case AVRCP_SUBEVENT_CONNECTION_RELEASED: {
@@ -305,7 +348,17 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
         break;
     }
     default:
-        Post(L"AVRCP[?]: 未处理子事件 0x%02x", packet[2]);
+        // 未知子事件只记一次（不刷屏）。已知会到这里但无需处理的：
+        //   0x10 SET_ABSOLUTE_VOLUME_RESPONSE / 0x11 NOTIFICATION_STATE
+        //   —— controller 命名空间的事件串到 target 处理器（btstack 双角色广播）
+        {
+            static uint8_t once[0x40] = { 0 };
+            if (packet[2] < 0x40 && !once[packet[2]]) {
+                once[packet[2]] = 1;
+                Post(L"AVRCP[target]: 未处理子事件 0x%02x（仅记录一次）", packet[2]);
+            }
+        }
+        break;
         break;
     }
 }
@@ -338,12 +391,64 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
     if (packet_type != HCI_EVENT_PACKET) return;
     if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
     switch (packet[2]) {
-    case AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED:
-        Post(L"AVRCP: 耳机音量 %d%%",
-             avrcp_subevent_notification_volume_changed_get_absolute_volume(packet) * 100 / 127);
+    case AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED: {
+        uint16_t acid = avrcp_subevent_notification_volume_changed_get_avrcp_cid(packet);
+        int vol = avrcp_subevent_notification_volume_changed_get_absolute_volume(packet);
+        int i = -1;
+        for (int k = 0; k < NUM_STREAMS; ++k)
+            if (media[k].avrcp_cid == acid) { i = k; break; }
+        if (i >= 0) {
+            // 回声过滤：耳机对我们设置的应答/通知可能滞后到达（事件通道异步），
+            // 旧值通知会在在途清零后落进窗口把缓存拽回（40→35→40 抖动）。
+            // 在途>0 或设置后 600ms 内的通知一律视为回声丢弃；真正的耳机
+            // 本地按键调节发生在这两种窗口之外，正常实时同步。
+            if (media[i].hpSetPending > 0 || GetTickCount() - media[i].hpSetLastMs < 600)
+                break;
+            // 假零过滤：有些耳机（AirPods）在第一次 SetAbsoluteVolume 之前，
+            // 绝对音量未"实体化"，interim 上报 0 并非真实值——采信它会把
+            // 显示钉在 0，用户一滚轮还会把耳机真写到 1%。保持"未知"。
+            if (vol == 0 && media[i].hpSetLastMs == 0)
+                break;
+            media[i].hpVolume = vol;
+            VolRemember(media[i].addr, vol);   // 记住真实值，下次假零时可落位
+            Post(L"AVRCP: 耳机音量 %d%%", vol * 100 / 127);
+        }
+        break;
+    }
+    case AVRCP_SUBEVENT_SET_ABSOLUTE_VOLUME_RESPONSE: {
+        // 设置命令的应答：耳机实际应用的音量。多笔在途时按序回来——
+        // 中间应答（旧值）直接丢弃，只在最后一笔回来时写缓存（权威校正）
+        uint16_t acid = avrcp_subevent_set_absolute_volume_response_get_avrcp_cid(packet);
+        int vol = avrcp_subevent_set_absolute_volume_response_get_absolute_volume(packet);
+        int i = -1;
+        for (int k = 0; k < NUM_STREAMS; ++k)
+            if (media[k].avrcp_cid == acid) { i = k; break; }
+        if (i >= 0) {
+            if (media[i].hpSetPending > 0) --media[i].hpSetPending;
+            if (media[i].hpSetPending == 0 && media[i].hpVolume != vol) {
+                media[i].hpVolume = vol;
+                VolRemember(media[i].addr, vol);
+                Post(L"AVRCP: 耳机确认音量 %d%%（校正）", vol * 100 / 127);
+            }
+        }
+        break;
+    }
+    case AVRCP_SUBEVENT_NOTIFICATION_STATE:
+        // 0x11：通知注册回执（enable_notification 的应答），无需处理
         break;
     default:
-        Post(L"AVRCP[ctrl]: 未处理子事件 0x%02x", packet[2]);
+        // 未知子事件只记一次。已知会到这里但无需处理的：
+        //   0x15 PLAY_STATUS（我们不查询播放状态）、0x16/0x17 OPERATION_START/COMPLETE
+        //   （耳机透传按键事件，我们不转发系统）、0x20-0x23 NOW_PLAYING 信息
+        //   0x1e EVENT_BATT/等等通知 —— 均与我们"纯推流"的场景无关
+        {
+            static uint8_t once[0x40] = { 0 };
+            if (packet[2] < 0x40 && !once[packet[2]]) {
+                once[packet[2]] = 1;
+                Post(L"AVRCP[ctrl]: 未处理子事件 0x%02x（仅记录一次）", packet[2]);
+            }
+        }
+        break;
         break;
     }
 }
@@ -397,8 +502,9 @@ static void ProduceAudioIdx(int i, int16_t * pcm, int num_frames)
     // 每次跳变 = 重采样位置瞬移 = 可闻咔哒声；200ms 内的波动让它自然流过）
     // 必须放在最前：测试音期间回环采集若仍在喂 ring，不跳转的话水位会积压到几十秒
     int rate = media[i].negRate > 0 ? media[i].negRate : 44100;
-    int hi = rate / 5;     // ~200ms
-    int lo = rate / 50;    // ~20ms
+    int hi = rate * 7 / 20;   // ~350ms（双路射频忙时的瞬时停滞不触发跳变，
+                              //   跳变 = 相位瞬移 = 可闻咔哒；延迟上限随之增大）
+    int lo = rate / 50;       // ~20ms
     if (RingAvailableIdx(i) > hi) {
         media[i].phase = (double)(g_wpos.load() - (uint64_t)lo);
     }
@@ -441,6 +547,18 @@ static void ProduceAudioIdx(int i, int16_t * pcm, int num_frames)
 
 static void send_media_packet(int i)
 {
+    // 发送间隔诊断：>150ms 的间隔 = 一次可闻卡顿风险。
+    // 用于定位卡顿落在哪个阶段（另一路连接时：寻呼/SDP/信令/AVRCP）
+    {
+        static DWORD lastSendMs[NUM_STREAMS] = { 0, 0 };
+        DWORD now = GetTickCount();
+        if (lastSendMs[i] != 0 && now - lastSendMs[i] > 150) {
+            Post(L"BTstack[%d]: 发送间隔 %ums（卡顿风险，%S）",
+                 i, now - lastSendMs[i],
+                 AnyStreamInSetup() ? "另一路连接中" : "稳态");
+        }
+        lastSendMs[i] = now;
+    }
     int frame_len = sbc_encoder_instance[i]->sbc_buffer_length(&sbc_encoder_state[i]);
     uint8_t nframes = (uint8_t)(media[i].sbc_storage_count / frame_len);
     media[i].sbc_storage[0] = nframes;
@@ -609,6 +727,21 @@ static void schedule_retry(const char* addr)
     Post(L"BTstack: 连接失败，已切换策略：全新配对（自动）");
 }
 
+static void JumpAllToLive()
+{
+    int64_t live = (int64_t)g_wpos.load();
+    uint32_t now = btstack_run_loop_get_time_ms();
+    for (int i = 0; i < NUM_STREAMS; ++i) {
+        if (!media[i].streaming) continue;
+        media[i].phase = (double)live;
+        media[i].samples_ready = 0;
+        media[i].time_audio_data_sent = now;      // 重置计时基准（关键）
+        media[i].acc_num_missed_samples = 0;
+        media[i].sbc_storage_count = 0;
+        media[i].sbc_ready_to_send = 0;
+    }
+}
+
 static void start_streaming(int i)
 {
     media[i].max_media_payload_size = btstack_min(a2dp_max_media_payload_size(media[i].a2dp_cid, media[i].local_seid),
@@ -616,15 +749,12 @@ static void start_streaming(int i)
     media[i].sbc_storage_count = 0;
     media[i].sbc_ready_to_send = 0;
     media[i].streaming = 1;
+    JumpAllToLive();          // 集合+1：新流和被连接过程卡住的兄弟流都从实时开始
     g_setupKillStreak = 0;   // 流成功打开 = 无进展计数清零
-    // A2DP 协商完成后再连 AVRCP：很多音箱（如 K3）不主动建 AVRCP，绝对音量就同步不了。
-    // （在信令刚建立时就连，AVRCP 的 SDP 查询会与协商竞争，K3 实测会挂断整条链路）
-    if (media[i].avrcp_cid == 0) {
-        bd_addr_t raddr;
-        sscanf_bd_addr(media[i].addr, raddr);
-        int r = avrcp_connect(raddr, &media[i].avrcp_cid);
-        Post(L"BTstack[%d]: 主动发起 AVRCP 连接 %S ret=%d", i, media[i].addr, r);
-    }
+    // A2DP 协商完成后再连 AVRCP（很多音箱不主动建）。再延迟 3 秒：
+    // 新流刚起时另一路正在推流，AVRCP 的 SDP 查询+连接是突发大户，
+    // 挪出最敏感的窗口，让先来的流先把缓冲垫起来
+    media[i].avrcpDelayTicks = 15;   // 15 * 200ms = 3s（poll 里递减，到 0 再连）
     btstack_run_loop_remove_timer(&media[i].audio_timer);
     btstack_run_loop_set_timer_handler(&media[i].audio_timer, audio_timeout);
     btstack_run_loop_set_timer_context(&media[i].audio_timer, (void*)(intptr_t)i);
@@ -702,14 +832,24 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
                 g_connBackoff = 50;
                 break;
             }
+            if (status == 0x09) {
+                // 0x09 = 对端拒绝连接（资源受限）：耳机应答了但拒绝建链——
+                // 几乎总是它正被其它设备占用（手机）或左右耳互连未完成。
+                // 与密钥无关，重配无意义。惯例：别连续敲打忙耳机（30s 退避）
+                g_connBackoff = 150;   // 30s
+                Post(L"BTstack: 耳机拒绝连接（0x09 资源受限）——被占用（手机）或左右耳互连中；30 秒后自动重试");
+                break;
+            }
             if (status == 0x81 || status == 0x04 || status == 0x08 || status == 0x1f
-                || status == 0x6a) {
+                || status == 0x6a || status == 0x02 || status == 0x16) {
                 // 0x81 = SDP_QUERY_INCOMPLETE（对端忙，如 AirPods 被分时访问）
                 // 0x04/0x08 = 寻呼/连接超时（耳机暂时不在可连接状态）
                 // 0x1f = 本地中止（我们的看门狗掐的，QCY 首建流不应答属正常，
                 //        掐死后重试一次就通——绝不能升级到重配，否则删密钥死循环）
                 // 0x69 = L2CAP RTX 超时（对端 10 秒没应答连接请求——耳机固件清理中）
                 // 0x6a = baseband 断开（对端挂断了链路——多见于上次会话残留未清）
+                // 0x02/0x16 = 寻呼限幅主动撤销产生的伪错误（本地取消/本地终止），
+                //             绝不能升级重配——那会删好密钥
                 // 这些都是暂态问题，直连重试即可。引擎退避后自动重连。
                 g_connBackoff = (status == 0x08) ? 60 : 50;   // 12s / 10s（TWS 清理残留需要时间）
                 Post(L"BTstack: 连接失败 status=0x%02x（暂态），退避后自动重试", status);
@@ -779,12 +919,12 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
                  (int)a2dp_subevent_signaling_media_codec_sbc_configuration_get_min_bitpool_value(packet),
                  c.max_bitpool_value);
             sbc_encoder_instance[i] = btstack_sbc_encoder_bluedroid_init_instance(&sbc_encoder_state[i]);
-            // 双路稳定优先：编码码率封顶 bp40。耳机协商的 max（如 53）会让两路
-            // 合计逼近单 dongle 射频上限，偶发缓冲溢出 = 单边断音
+            // 编码码率封顶（用户可选）：双路时两路合计容易逼近单 dongle 射频
+            // 上限，偶发缓冲溢出 = 单边断音/交替。切低码率可留足射频余量。
             int bp = c.max_bitpool_value;
-            if (bp > 40) {
-                Post(L"AVDTP[%d]: bitpool %d -> 40（双路射频余量）", i, bp);
-                bp = 40;
+            if (bp > g_bpCap) {
+                Post(L"AVDTP[%d]: bitpool %d -> %d（码率上限）", i, bp, g_bpCap);
+                bp = g_bpCap;
             }
             sbc_encoder_instance[i]->configure(&sbc_encoder_state[i], SBC_MODE_STANDARD,
                                             c.block_length, c.subbands,
@@ -894,6 +1034,8 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
                 g_passiveAfterDrop = true;
                 Post(L"BTstack: 已进入被动等待（耳机回连自动恢复，不再主动寻呼）");
             }
+            // 集合-1：断链控制过程挤占过射频，剩余的流重置缓冲从实时继续
+            if (AnyStreamStreaming()) JumpAllToLive();
             media[i].a2dp_cid   = 0;
             media[i].stream_opened = 0;
             media[i].streaming  = 0;
@@ -915,8 +1057,20 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
     }
 
     default:
-        // 诊断：把所有未处理子事件打出来，避免错误被静默吞掉
-        Post(L"A2DP[?]: 未处理子事件 0x%02x", hci_event_a2dp_meta_get_subevent_code(packet));
+        // 未知子事件只记一次。已知会到这里但无需处理的：
+        //   0x13-0x18 各编解码能力上报（SBC/AAC/ATRAC/其它——SEP 发现时的信息，
+        //            btstack 内部已用它们完成协商，应用层不用再处理）
+        //   0x19 延迟上报能力（我们注册了 delay reporting category，信息性）
+        //   0x1a-0x1c 为 AVDTP 层事件（与 A2DP 共用 meta 命名空间的串扰）
+        {
+            static uint8_t once[0x40] = { 0 };
+            uint8_t c = hci_event_a2dp_meta_get_subevent_code(packet);
+            if (c < 0x40 && !once[c]) {
+                once[c] = 1;
+                Post(L"A2DP[?]: 未处理子事件 0x%02x（仅记录一次）", c);
+            }
+        }
+        break;
         break;
     }
 }
@@ -1195,12 +1349,13 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
     if (evt == HCI_EVENT_PIN_CODE_REQUEST) {
         bd_addr_t addr;
         hci_event_pin_code_request_get_bd_addr(packet, addr);
-        // PIN 陷阱：耳机存有旧绑但我们对不上 → 传统 PIN 必失败。
-        // 照常应答 0000（让链路正常失败），同时升级策略为全新配对。
+        // 原则：永不参与传统 PIN 配对——回答 "0000" 既必败，
+        // 万一成还会造出 legacy 弱密钥绑定。直接中止传统配对，
+        // 让链路按"配对失败"收场，引擎升级全新 SSP 重试（Just Works 永远免密）。
         g_strategy = 1;
         g_pairing = true;
-        Post(L"BTstack: PIN 配对请求（耳机有旧绑定）-> 升级为全新配对");
-        gap_pin_code_response(addr, "0000");
+        Post(L"BTstack: 拒绝传统 PIN 配对 -> 引擎将全新 SSP 重试");
+        gap_pin_code_negative(addr);
         return;
     }
     if (evt == HCI_EVENT_LINK_KEY_NOTIFICATION) {
@@ -1325,20 +1480,37 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
     // 优雅停止：退出请求后先断流 + 断 ACL（400ms），再真正退出。
     // 直接杀栈会让耳机异常掉线并疯狂自动重连，与新栈的寻呼撞车（0x08 超时）
     if (g_exitReq.load()) {
+        static DWORD stopDeadline = 0;
         if (!g_stopCleaned) {
             g_stopCleaned = true;
+            int n = 0;
             for (int i = 0; i < NUM_STREAMS; ++i) {
                 if (media[i].a2dp_cid != 0) {
-                    Post(L"BTstack[%d]: 优雅停止：断开 A2DP", i);
+                    Post(L"BTstack[%d]: 优雅停止：断开 A2DP %S", i, media[i].addr);
                     a2dp_source_disconnect(media[i].a2dp_cid);
+                    ++n;
                 }
                 if (media[i].acl_handle != HCI_CON_HANDLE_INVALID)
                     gap_disconnect(media[i].acl_handle);
             }
-            btstack_run_loop_set_timer(ts, 400);
+            Post(L"BTstack: 优雅停止：已发断开 %d 路，等待释放完毕…", n);
+            stopDeadline = GetTickCount() + 2000;
+            btstack_run_loop_set_timer(ts, 100);
             btstack_run_loop_add_timer(ts);
             return;
         }
+        // 等待全部流真正释放（对端确认 + 链路拆除），2 秒兜底
+        bool allReleased = true;
+        for (int i = 0; i < NUM_STREAMS; ++i) {
+            if (media[i].a2dp_cid != 0 || media[i].stream_opened) { allReleased = false; break; }
+        }
+        if (!allReleased && GetTickCount() < stopDeadline) {
+            btstack_run_loop_set_timer(ts, 100);
+            btstack_run_loop_add_timer(ts);
+            return;
+        }
+        if (!allReleased) Post(L"BTstack: 优雅停止：等待释放超时（2s），强制退出");
+        else             Post(L"BTstack: 优雅停止：全部释放完毕，退出");
         btstack_run_loop_trigger_exit();
         return;
     }
@@ -1395,7 +1567,9 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
 
     // 配对成功后延迟建流（等 dedicated bonding 的链路彻底断开）
     if (g_pairDelayConnect) {
-        if (++g_pairDelayTicks >= 12) {   // 12 * 200ms = 2.4s
+        if (++g_pairDelayTicks >= 25) {   // 25 * 200ms = 5s
+            // 5s 而不是更短：TWS 配对完成后有几秒"整理期"（左右耳同步、
+            // 新密钥写闪存），期间不响应寻呼——太早建流必吃 0x08
             g_pairDelayConnect = false;
             g_cmdConnect.store(true);
         }
@@ -1449,6 +1623,78 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
             Post(L"BTstack: 扫描请求已排队，等待适配器就绪…");
         }
     }
+    // 寻呼限幅：一路正在推流时，另一路的建流寻呼不得整段跑完——
+    // 对端不在场时寻呼会空跑满 5 秒超时，期间推流包间隔被挤到 150~420ms
+    // （诊断已证实，耳机缓冲打穿=可闻卡顿）。1.2 秒未通即主动撤销让位推流；
+    // 撤销触发的失败按暂态退避，引擎稍后再试（寻呼占空比大幅下降）
+    static int g_pageTicks = 0;
+    if (AnyStreamStreaming() && AnyStreamInSetup() && !g_pairing && !g_pairForce) {
+        if (++g_pageTicks >= 10) {         // 10 * 200ms = 2s（QCY 寻呼慢，1.2s 太紧）
+            g_pageTicks = 0;
+            for (int i = 0; i < NUM_STREAMS; ++i) {
+                if (media[i].a2dp_cid != 0 && !media[i].stream_opened && media[i].addr[0]) {
+                    ClassicConnectCancel(media[i].addr);
+                    g_connBackoff = 15;   // 取消后歇 3s：防止引擎瞬时重试空转 churn
+                    Post(L"BTstack[%d]: 寻呼限幅：2s 未通即撤销（保推流），3s 后自动重试", i);
+                }
+            }
+        }
+    } else {
+        g_pageTicks = 0;
+    }
+
+    // 音量探测落位：耳机 1.6s 内没上报可信音量（假零被过滤/无通知）→
+    // 用记忆值（上次真实音量）主动落位；没记住过则 50%。
+    // 这让显示和真实一致，而不是悬在"未知"
+    for (int i = 0; i < NUM_STREAMS; ++i) {
+        if (media[i].volProbeTicks > 0 && media[i].avrcp_cid && media[i].addr[0]) {
+            if (--media[i].volProbeTicks == 0) {
+                if (media[i].hpSetLastMs == 0 && media[i].hpVolume <= 0) {
+                    int v = VolRemembered(media[i].addr);
+                    if (v < 0) v = 64;   // 没记住过：50% 起步
+                    avrcp_controller_set_absolute_volume(media[i].avrcp_cid, (uint8_t)v);
+                    media[i].hpSetPending++;
+                    media[i].hpSetLastMs = GetTickCount();
+                    media[i].hpVolume = v;   // 乐观更新（应答会校正）
+                    Post(L"AVRCP: 耳机未上报音量，应用记忆值 %d%%", v * 100 / 127);
+                }
+            }
+        }
+    }
+
+    // AVRCP 延迟连接：推流启动 3 秒后（避开另一路刚起流的最敏感窗口）
+    for (int i = 0; i < NUM_STREAMS; ++i) {
+        if (media[i].avrcpDelayTicks > 0 && media[i].streaming) {
+            if (--media[i].avrcpDelayTicks == 0 && media[i].avrcp_cid == 0) {
+                bd_addr_t raddr;
+                sscanf_bd_addr(media[i].addr, raddr);
+                int r = avrcp_connect(raddr, &media[i].avrcp_cid);
+                Post(L"BTstack[%d]: 主动发起 AVRCP 连接 %S ret=%d（延迟 3s）", i, media[i].addr, r);
+            }
+        }
+    }
+
+    // 跳实时（复制开始等推流情况变化）：清空各路待发缓存，从实时边开始
+    if (g_cmdJumpLive.exchange(false)) {
+        JumpAllToLive();
+        Post(L"BTstack: 已清空待发缓存，从实时边开始推流");
+    }
+
+    // 设置耳机音量（来自 UI，转到本线程执行 AVRCP 命令）。
+    // 缓存已在 BtSvcSetHpVolume 调用点乐观更新（消除轮询延迟）。
+    // 每笔命令记一笔"在途"：应答按序到达，只有最后一笔的应答才写缓存，
+    // 否则中间应答（已被新值取代的旧音量）会把缓存来回拉扯（40→35→40 抖动）
+    if (g_cmdHpVolume.exchange(false)) {
+        int i = FindStreamByAddr(g_hpVolAddr);
+        if (i >= 0 && media[i].avrcp_cid) {
+            avrcp_controller_set_absolute_volume(media[i].avrcp_cid, (uint8_t)g_hpVolVal);
+            media[i].hpSetPending++;
+            media[i].hpSetLastMs = GetTickCount();
+            Post(L"AVRCP: 设置 %S 音量 -> %d%%", g_hpVolAddr, g_hpVolVal * 100 / 127);
+        }
+        g_hpVolAddr[0] = 0;
+    }
+
     // 按地址断开（双路）：只断选中的那路，另一路不受影响
     if (g_cmdDisconnectAddr.exchange(false)) {
         int i = FindStreamByAddr(g_discAddr);
@@ -1947,10 +2193,101 @@ void BtSvcSetTestToneAddr(const char* addr, bool on)
     if (i >= 0) media[i].testTone = on ? 1 : 0;
 }
 
+// ------------------------------------------------------------ SBC 码率上限（用户可选）
+
+void BtSvcSetBitpoolCap(int cap)
+{
+    if (cap < 2) cap = 2;
+    if (cap > 53) cap = 53;
+    if ((int)g_bpCap != cap) {
+        g_bpCap = cap;
+        Post(L"BTstack: 码率上限 = bp%d（重连后生效）", cap);
+    }
+}
+
+int BtSvcGetBitpoolCap() { return g_bpCap; }
+
+// ------------------------------------------------------------ 耳机音量（AVRCP 绝对音量）
+
+// 每设备记忆音量（上次真实值），持久化 volumes.txt。
+// 用途：耳机注册通知的 interim 上报假 0（AirPods 怪癖）时，
+// 用记忆值主动落位——显示与真实一致，而不是悬在"未知"
+static std::recursive_mutex          g_volLock;
+static std::map<std::string, int>    g_volMap;
+static bool                         g_volLoaded = false;
+
+static void VolLoad()
+{
+    FILE* f = nullptr;
+    if (fopen_s(&f, AppFile("volumes.txt").c_str(), "r") != 0 || !f) return;
+    char line[64];
+    while (fgets(line, sizeof(line), f)) {
+        char a[32] = ""; int v = 0;
+        if (sscanf_s(line, "%31s %d", a, (unsigned)sizeof(a), &v) == 2 && a[0])
+            g_volMap[a] = v;
+    }
+    fclose(f);
+}
+
+// 记住某设备的真实音量（通知/应答里的权威值到达时调用）
+static void VolRemember(const char* addr, int vol)
+{
+    if (!addr || !addr[0] || vol < 0 || vol > 127) return;
+    std::lock_guard<std::recursive_mutex> lk(g_volLock);
+    if (!g_volLoaded) { g_volLoaded = true; VolLoad(); }
+    char up[32] = "";
+    for (int i = 0; addr[i] && i < 31; ++i)
+        up[i] = (char)toupper((unsigned char)addr[i]);
+    auto it = g_volMap.find(up);
+    if (it != g_volMap.end() && it->second == vol) return;   // 没变不写盘
+    g_volMap[up] = vol;
+    FILE* f = nullptr;
+    if (fopen_s(&f, AppFile("volumes.txt").c_str(), "w") != 0 || !f) return;
+    for (auto& kv : g_volMap) fprintf(f, "%s %d\n", kv.first.c_str(), kv.second);
+    fclose(f);
+}
+
+// 取记忆音量（-1 = 没记住过）
+static int VolRemembered(const char* addr)
+{
+    if (!addr || !addr[0]) return -1;
+    std::lock_guard<std::recursive_mutex> lk(g_volLock);
+    if (!g_volLoaded) { g_volLoaded = true; VolLoad(); }
+    char up[32] = "";
+    for (int i = 0; addr[i] && i < 31; ++i)
+        up[i] = (char)toupper((unsigned char)addr[i]);
+    auto it = g_volMap.find(up);
+    return it == g_volMap.end() ? -1 : it->second;
+}
+
+// 读某路的耳机当前音量（0..127；-1 = 未知/未连接 AVRCP）
+int BtSvcGetHpVolume(const char* addr)
+{
+    int i = FindStreamByAddr(addr);
+    return (i >= 0) ? media[i].hpVolume : -1;
+}
+
+// 设置某路的耳机音量（0..127）。经命令队列转到 BTstack 线程执行
+// （命令变量声明在顶部命令标志区，poll 中使用）
+
+void BtSvcSetHpVolume(const char* addr, int vol127)
+{
+    if (!addr || !addr[0]) return;
+    if (vol127 < 0) vol127 = 0;
+    if (vol127 > 127) vol127 = 127;
+    strcpy_s(g_hpVolAddr, sizeof(g_hpVolAddr), addr);
+    g_hpVolVal = vol127;
+    g_cmdHpVolume.store(true);
+    // 立即乐观更新缓存：UI 下一帧就能读到，消除命令队列 200ms 轮询延迟
+    // （耳机应答 0x10 到达时用真实值覆盖；耳机本地按键通知同样覆盖）
+    int i = FindStreamByAddr(addr);
+    if (i >= 0) media[i].hpVolume = vol127;
+}
+
 void BtSvcSetGain(float gain)
 {
     if (gain < 0) gain = 0;
-    if (gain > 2) gain = 2;
+    if (gain > 40) gain = 40;   // ~+32dB 上限（编码前有 int16 削波保护）
     float old = g_gain.exchange(gain);
     // 轮询同步会高频调用，值未变化时打日志会刷屏
     if (old != gain)
@@ -2008,10 +2345,10 @@ void BtSvcStop()
     //   第二拍（400ms 后）：btstack_run_loop_trigger_exit
     // 若 run loop 已不在（USB 卡死等），3 秒超时分离兜底。
     HANDLE h = g_thread.native_handle();
-    if (WaitForSingleObject(h, 3000) == WAIT_OBJECT_0) {
+    if (WaitForSingleObject(h, 5000) == WAIT_OBJECT_0) {
         g_thread.join();
     } else {
-        g_thread.detach();             // 放任后台自行退出
+        g_thread.detach();             // 放任后台自行退出（罕见：线程卡死）
     }
     g_thread = {};
     g_running.store(false);
@@ -2043,8 +2380,47 @@ bool BtSvcIsConnectingAddr(const char* addr)
 bool BtSvcThreadActive() { return g_thread.joinable(); }
 bool BtSvcTestTone() { return g_testTone.load(); }
 
+// ------------------------------------------------------------ 推流跳实时（清待发缓存，从此刻开始）
+
+// 推流情况变化（复制开始/恢复、测试音切换）时调用：清空待发缓存并跳到
+// 实时边——连接期间攒下的陈旧音频不再发，从"此刻"的采集数据开始
+void BtSvcJumpToLive()
+{
+    g_cmdJumpLive.store(true);
+}
+
+// ------------------------------------------------------------ 采集信号指示器（UI 防抖指示）
+static std::atomic<float>     g_capLevel{ 0.0f };      // 平滑电平（服务侧快起慢落，可多读者）
+static volatile DWORD        g_capSoundMs = 0;         // 最近一次检测到非静音的时刻
+
+// 当前采集电平（0..1，纯读，多读者共享：主指示器 + 各设备行）
+float BtSvcCaptureLevel()
+{
+    return g_capLevel.load();
+}
+
+// 采集是否活着：近 1.5s 内出现过非静音信号
+bool BtSvcCaptureAlive()
+{
+    DWORD ms = g_capSoundMs;
+    return ms != 0 && GetTickCount() - ms < 1500;
+}
+
 void BtSvcFeedAudio(const short* pcm, int frames, int feedRate)
 {
+    // 采集信号测量（供 UI 指示器）：块峰值 → 服务侧平滑（快起慢落）
+    {
+        int pk = 0;
+        for (int i = 0; i < frames * NUM_CHANNELS; ++i) {
+            int a = pcm[i] < 0 ? -pcm[i] : pcm[i];
+            if (a > pk) pk = a;
+        }
+        float p = (float)pk / 32768.0f;
+        float sm = g_capLevel.load();
+        g_capLevel.store(p > sm ? p : sm * 0.90f);      // 快起，慢落（按块）
+        if (pk > 200) g_capSoundMs = GetTickCount();   // 静音阈值 ~0.6%
+    }
+
     if (!g_thread.joinable()) return;
     if (g_ring.empty()) return;          // 未初始化保护（防越界崩溃）
     g_feedRate.store(feedRate);
@@ -2062,6 +2438,9 @@ void BtSvcFeedAudio(const short* pcm, int frames, int feedRate)
 
 static DWORD WINAPI BtThread(LPVOID)
 {
+    // Windows 默认定时器精度 15.6ms——音频发送要求 10ms 节拍，不提高精度
+    // 会按 15.6ms 量化，节拍抖动直接表现为周期性卡顿
+    timeBeginPeriod(1);
     g_serviceStartTick = GetTickCount();   // 服务启动时刻（防撞车被动窗口用）
     while (!g_exitReq.load()) {
         g_stopCleaned = false;
@@ -2115,5 +2494,6 @@ static DWORD WINAPI BtThread(LPVOID)
         break;
     }
     Post(L"BTstack: 已停止");
+    timeEndPeriod(1);   // 恢复系统默认定时器精度
     return 0;
 }

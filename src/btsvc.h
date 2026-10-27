@@ -70,6 +70,13 @@ void BtSvcFeedAudio(const short* pcm, int frames, int feedRate);
 void BtSvcSetTestTone(bool on);
 bool BtSvcTestToneAddr(const char* addr);      // 按设备：该路测试音状态
 void BtSvcSetTestToneAddr(const char* addr, bool on);   // 按设备：只开关该路
+int  BtSvcGetHpVolume(const char* addr);       // 该路耳机当前音量（0..127，-1 未知）
+void BtSvcSetHpVolume(const char* addr, int vol127);   // 设置该路耳机音量
+void BtSvcSetBitpoolCap(int cap);              // SBC 码率上限（重连后生效）
+int  BtSvcGetBitpoolCap();
+float BtSvcCaptureLevel();                    // 采集平滑电平（0..1，纯读，多读者）
+void BtSvcJumpToLive();                       // 清空待发缓存，跳到实时边（推流状态变化时）
+bool BtSvcCaptureAlive();                      // 近 1.5s 内有非静音信号
 bool BtSvcTestTone();
 
 // 推流音量（软件增益，作用于编码前的 PCM，1.0 = 原始电平，0 = 静音）
