@@ -1,6 +1,7 @@
 // BTstack A2DP Source 服务实现：线程化 + 真实音频输入 + 双路推流
 // 双路：同一个 dongle 同时向两副耳机推流（同一份音频，各自独立编码/发送）
 #include "btsvc.h"
+#include "mediactrl.h"
 
 #include <Windows.h>
 #include <stdint.h>
@@ -379,6 +380,25 @@ static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, u
                                  play_info.song_position_ms, play_info.status);
         break;
     }
+    case AVRCP_SUBEVENT_OPERATION: {
+        // 耳机按键（TG→CT 透传，只从 target 路到达；btstack 已自动应答）。
+        // PLAY/PAUSE → 控制 SMTC 系统播放器；只响应按下（button_pressed=1），
+        // 释放事件忽略（同一次按键会产生按下+释放两个事件）
+        uint16_t acid = avrcp_subevent_operation_get_avrcp_cid(packet);
+        uint8_t opid  = avrcp_subevent_operation_get_operation_id(packet);
+        uint8_t press = avrcp_subevent_operation_get_button_pressed(packet);
+        if (press && (opid == AVRCP_OPERATION_ID_PLAY || opid == AVRCP_OPERATION_ID_PAUSE)) {
+            bool play = (opid == AVRCP_OPERATION_ID_PLAY);
+            Post(L"AVRCP: 耳机按键：%s系统播放", play ? L"继续" : L"暂停");
+            if (play) MediaPlay();
+            else      MediaPause();
+            play_info.status = play ? AVRCP_PLAYBACK_STATUS_PLAYING
+                                    : AVRCP_PLAYBACK_STATUS_PAUSED;
+            if (acid)
+                avrcp_target_set_playback_status(acid, play_info.status);
+        }
+        break;
+    }
     default:
         Post(L"AVRCP[target]: 未处理子事件 0x%02x", packet[2]);
         break;
@@ -435,6 +455,11 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
     }
     case AVRCP_SUBEVENT_NOTIFICATION_STATE:
         // 0x11：通知注册回执（enable_notification 的应答），无需处理
+        break;
+    case AVRCP_SUBEVENT_OPERATION_START:
+    case AVRCP_SUBEVENT_OPERATION_COMPLETE:
+        // 我们自己发出的透传命令的回执（我们从不发送透传操作，不会到达）。
+        // 耳机按键只从 target 路的 AVRCP_SUBEVENT_OPERATION(0x1a) 到达。
         break;
     default:
         // 未知子事件只记一次。已知会到这里但无需处理的：
@@ -1056,12 +1081,18 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
         break;
     }
 
+    case A2DP_SUBEVENT_SIGNALING_DELAY_REPORT:
+        // 0x1a = 耳机的延迟报告（支持 delay reporting 的耳机建流后主动上报
+        // 端缓冲延迟，AirPods 等）。信息性事件，btstack 内部已按特性协商处理，
+        // 应用层无需动作——正确忽略即可，不再当"未知"记录。
+        break;
+
     default:
         // 未知子事件只记一次。已知会到这里但无需处理的：
         //   0x13-0x18 各编解码能力上报（SBC/AAC/ATRAC/其它——SEP 发现时的信息，
         //            btstack 内部已用它们完成协商，应用层不用再处理）
         //   0x19 延迟上报能力（我们注册了 delay reporting category，信息性）
-        //   0x1a-0x1c 为 AVDTP 层事件（与 A2DP 共用 meta 命名空间的串扰）
+        //   0x1b/0x1c 为 AVDTP 层事件（与 A2DP 共用 meta 命名空间的串扰）
         {
             static uint8_t once[0x40] = { 0 };
             uint8_t c = hci_event_a2dp_meta_get_subevent_code(packet);
@@ -1516,6 +1547,22 @@ static void poll_timer_handler(btstack_timer_source_t * ts)
     }
 
     if (g_connBackoff > 0) g_connBackoff--;
+
+    // 推流生命周期联动系统播放：所有推流断开 → 暂停播放；
+    // 有推流建立 → 继续播放（SMTC 真实 Play/Pause，不盲发媒体键）
+    {
+        static bool prevAny = false;
+        bool any = AnyStreamStreaming();
+        if (any && !prevAny) {
+            Post(L"BTstack: 推流已建立 —— 继续系统播放");
+            MediaPlay();
+        } else if (!any && prevAny) {
+            Post(L"BTstack: 所有推流已断开 —— 暂停系统播放");
+            MediaPause();
+        }
+        prevAny = any;
+    }
+
 
     // page scan 协调（业界标准做法，参照 ESP-IDF a2dp_source 的 NON_CONNECTABLE）：
     // 主动连接进行中关闭 page scan —— 耳机同时对我们的寻呼无人应答，自然放弃，

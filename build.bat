@@ -57,6 +57,9 @@ cl %CFLAGS% /c /Fo:build\bt\ ^
 if errorlevel 1 goto :fail
 
 echo --- GUI ---
+rem mediactrl.cpp 需要 C++17（cppwinrt/SMTC），单独编译成 obj
+cl /nologo /utf-8 /std:c++17 /permissive- /EHsc /DNOMINMAX /Fo:build\mediactrl.obj /c src\mediactrl.cpp
+if errorlevel 1 goto :fail
 rem 注：src\btpanel3.cpp 为 WebView2 备用面板（未参与编译）。如需启用：
 rem   1) 在下行 sources 中加入 src\btpanel3.cpp
 rem   2) include 路径加 /I"webview2\include"
@@ -69,14 +72,14 @@ cl %CFLAGS% /Fo:build\ /Fe:build\DualBlt.exe src\engine.cpp src\gui.cpp src\btpa
   /I"%PORT%" /I"%BTSTACK%\src" /I"%BTSTACK%\src\classic" /I"%BTSTACK%\platform\windows" ^
   /I"%BTSTACK%\3rd-party\bluedroid\encoder\include" /I"%BTSTACK%\3rd-party\bluedroid\decoder\include" ^
   /I"%BTSTACK%\..\imgui" /I"%BTSTACK%\..\imgui\backends" ^
-  /link /SUBSYSTEM:WINDOWS build\bt\*.obj winusb.lib setupapi.lib ws2_32.lib d3d11.lib dxgi.lib newdev.lib
+  /link /SUBSYSTEM:WINDOWS build\bt\*.obj build\mediactrl.obj winusb.lib setupapi.lib ws2_32.lib d3d11.lib dxgi.lib newdev.lib windowsapp.lib
 if errorlevel 1 goto :fail
 
 echo --- CLI ---
 cl %CFLAGS% /Fo:build\ /Fe:build\DualBltCli.exe src\engine.cpp src\main.cpp src\btsvc.cpp ^
   /I"%PORT%" /I"%BTSTACK%\src" /I"%BTSTACK%\src\classic" /I"%BTSTACK%\platform\windows" ^
   /I"%BTSTACK%\3rd-party\bluedroid\encoder\include" /I"%BTSTACK%\3rd-party\bluedroid\decoder\include" ^
-  /link /SUBSYSTEM:CONSOLE build\bt\*.obj winusb.lib setupapi.lib ws2_32.lib
+  /link /SUBSYSTEM:CONSOLE build\bt\*.obj build\mediactrl.obj winusb.lib setupapi.lib ws2_32.lib windowsapp.lib user32.lib
 if errorlevel 1 goto :fail
 
 echo --- BT radios probe ---
